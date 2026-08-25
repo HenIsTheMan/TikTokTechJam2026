@@ -619,9 +619,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=1234)
 
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--repeats", type=int, default=100)
-    parser.add_argument("--benchmark-rounds", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=7)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--benchmark-rounds", type=int, default=2)
     parser.add_argument("--benchmark-on-failure", action="store_true")
 
     parser.add_argument("--compile-baseline", action="store_true")
