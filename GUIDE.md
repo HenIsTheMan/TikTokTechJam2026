@@ -2,9 +2,7 @@
 * python3 -m venv venv
 * source venv/bin/activate
 * pip install numpy
-* [Either] pip install torch
-* [Or] pip install tensorflow
+* pip install torch
 
-## Run (choose 1)
+## Run
 * python3 torch_transformer_benchmark.py
-* python3 tensorflow_transformer_benchmark.py
