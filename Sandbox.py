@@ -56,7 +56,7 @@ class TransformerConfig:
             raise ValueError("num_layers must be positive")
 
 
-class BaselineSelfAttention(nn.Module):
+class BaselineSelfAttention(nn.Module): # nn.Module is base class
     """Explicit multi-head self-attention implemented with native PyTorch ops."""
 
     def __init__(self, d_model: int, num_heads: int) -> None:
@@ -169,42 +169,23 @@ class BaselineTransformer(nn.Module):
         x = self.final_norm(x)
         if valid_token_mask is not None:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
-        return x
+        return x # Return tensor with shape [batch_size, seq_len, d_model]
 
 
 class UserOptimizedTransformer(BaselineTransformer):
-    """
-    Replace this class with the optimized implementation.
-
-    Requirements:
-      1. Keep the forward signature unchanged.
-      2. Return a tensor with shape [batch_size, seq_len, d_model].
-      3. Keep compatible parameter names, or customize copy_model_weights().
-    """
-
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # ====================== your codes here ======================
-        # Example optimization directions:
-        #   * torch.nn.functional.scaled_dot_product_attention
-        #   * torch.compile
-        #   * Triton/CUDA fused kernels
-        #   * fused LayerNorm / residual / FFN
-        #
-        # The default implementation calls the baseline so that this script
-        # remains directly runnable before the optimized code is inserted.
+    ) -> torch.Tensor: # Func sig cannot be changed
         return super().forward(x, valid_token_mask)
-        # ============================================================
 
 
 def copy_model_weights(
     baseline: nn.Module, optimized: nn.Module, strict: bool = True
-) -> None:
+) -> None: # We will not mod this so all Transformer model param names (e.g. self.q_proj) will be kept the same
     """Copy identical weights into both implementations for a fair comparison."""
-    state_dict = copy.deepcopy(baseline.state_dict())
+    state_dict = copy.deepcopy(baseline.state_dict()) # baseline.state_dict() gives state of BaselineTransformer mod and all its registered submods
     incompatible = optimized.load_state_dict(state_dict, strict=strict)
     if not strict:
         if incompatible.missing_keys:
