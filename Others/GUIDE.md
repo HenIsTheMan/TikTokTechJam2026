@@ -5,7 +5,7 @@
 * pip install torch
 
 ## Run
-* python3 Sandbox.py
+* python3 Sandbox.py --warmup 7 --repeats 5 --benchmark-rounds 2
 
 ## Possible Optimizations
 * [Overall] Custom CUDA, Triton, TensorFlow or PyTorch implementations
