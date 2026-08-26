@@ -1,29 +1,135 @@
 #!/usr/bin/env python3
-"""
-Compare numerical accuracy and inference latency between a baseline Transformer
-and a user-optimized implementation.
-
-Correctness rule for every output element:
-    abs(user - ref) <= atol
-    OR
-    abs(user - ref) <= rtol * abs(ref)
-
-The default thresholds are atol=0.001 and rtol=0.01 (1%).
-"""
 
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import argparse
 import copy
 import math
 import statistics
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# Parse Cmd-Line Args
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare a baseline and optimized PyTorch Transformer"
+    )
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=512)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--ffn-dim", type=int, default=2048)
+    parser.add_argument("--layers", type=int, default=6)
+    parser.add_argument("--causal", action="store_true")
+
+    parser.add_argument(
+        "--device", default="auto", help="auto, cpu, cuda, cuda:0, ..."
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default="float32",
+    )
+    parser.add_argument("--padding-ratio", type=float, default=0.0)
+    parser.add_argument("--input-scale", type=float, default=1.0)
+
+    parser.add_argument("--accuracy-trials", type=int, default=5)
+    parser.add_argument("--rtol", type=float, default=0.01) # 1%
+    parser.add_argument("--atol", type=float, default=0.001) # 0.1%
+    parser.add_argument("--seed", type=int, default=1234)
+
+    parser.add_argument("--warmup", type=int, default=7)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--benchmark-rounds", type=int, default=2)
+    parser.add_argument("--benchmark-on-failure", action="store_true")
+
+    parser.add_argument("--compile-baseline", action="store_true")
+    parser.add_argument("--compile-user", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+    )
+    parser.add_argument("--non-strict-weight-copy", action="store_true")
+    parser.add_argument(
+        "--matmul-precision",
+        choices=("highest", "high", "medium"),
+        default="high",
+    )
+    parser.add_argument(
+        "--allow-tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable/disable TF32 on CUDA for both implementations",
+    )
+    return parser.parse_args()
+
+
+# Resolve Device (CPU or Cuda)
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_arg)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False")
+    return device
+
+
+# Resolve Data Type
+def resolve_dtype(dtype_name: str) -> torch.dtype:
+    mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    return mapping[dtype_name]
+
+
+# Validate Cmd-Line Args, Device and Data Type
+def validate_some(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> None:
+    if not 0.0 <= args.padding_ratio < 1.0:
+        raise ValueError("padding_ratio must be in [0, 1)")
+    if args.input_scale <= 0:
+        raise ValueError("input_scale must be positive")
+    if args.accuracy_trials <= 0:
+        raise ValueError("accuracy_trials must be positive")
+    if args.rtol < 0 or args.atol < 0:
+        raise ValueError("rtol and atol must be non-negative")
+    if args.warmup < 0:
+        raise ValueError("warmup must be non-negative")
+    if args.repeats <= 0 or args.benchmark_rounds <= 0:
+        raise ValueError("repeats and benchmark_rounds must be positive")
+    if device.type == "cpu" and dtype == torch.float16:
+        print("[warning] float16 CPU kernels may be unsupported or slow")
+
+
+# Copy Model Weights (identical for BaselineTransformer and UserOptimizedTransformer)
+def copy_model_weights(
+    baseline: nn.Module, optimized: nn.Module, strict: bool = True
+) -> None: # We will not mod this so all Transformer model param names (e.g. self.q_proj) must be kept the same
+    state_dict = copy.deepcopy(baseline.state_dict()) # baseline.state_dict() gives state of BaselineTransformer mod and all its registered submods
+    
+    incompatible = optimized.load_state_dict(state_dict, strict=strict)
+    
+    if not strict:
+        if incompatible.missing_keys:
+            print(f"[warning] missing optimized keys: {incompatible.missing_keys}")
+        if incompatible.unexpected_keys:
+            print(f"[warning] unexpected optimized keys: {incompatible.unexpected_keys}")
+
+
+# Try Compile Transformer Model
+def maybe_compile(model: nn.Module, enabled: bool, mode: str) -> nn.Module:
+    if not enabled:
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("this PyTorch build does not provide torch.compile")
+    return torch.compile(model, mode=mode)
 
 
 @dataclass(frozen=True)
@@ -56,162 +162,7 @@ class TransformerConfig:
             raise ValueError("num_layers must be positive")
 
 
-class BaselineSelfAttention(nn.Module): # nn.Module is base class
-    """Explicit multi-head self-attention implemented with native PyTorch ops."""
-
-    def __init__(self, d_model: int, num_heads: int) -> None:
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = self.head_dim**-0.5
-
-        self.q_proj = nn.Linear(d_model, d_model, bias=True)
-        self.k_proj = nn.Linear(d_model, d_model, bias=True)
-        self.v_proj = nn.Linear(d_model, d_model, bias=True)
-        self.out_proj = nn.Linear(d_model, d_model, bias=True)
-
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-        return (
-            x.view(batch, seq_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-            .contiguous()
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-        causal: bool = False,
-    ) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-
-        q = self._split_heads(self.q_proj(x))
-        k = self._split_heads(self.k_proj(x))
-        v = self._split_heads(self.v_proj(x))
-
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        if causal:
-            causal_mask = torch.ones(
-                (seq_len, seq_len), device=x.device, dtype=torch.bool
-            ).triu(diagonal=1)
-            scores = scores.masked_fill(causal_mask, float("-inf"))
-
-        if valid_token_mask is not None:
-            # Mask invalid key positions. Shape: [B, 1, 1, S].
-            invalid_keys = ~valid_token_mask[:, None, None, :]
-            scores = scores.masked_fill(invalid_keys, float("-inf"))
-
-        # Computing softmax in fp32 provides a stable reference for fp16/bf16 tests.
-        probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
-        context = torch.matmul(probs, v)
-        context = (
-            context.transpose(1, 2)
-            .contiguous()
-            .view(batch, seq_len, self.d_model)
-        )
-        output = self.out_proj(context)
-
-        if valid_token_mask is not None:
-            output = output.masked_fill(~valid_token_mask[..., None], 0)
-        return output
-
-
-class BaselineTransformerBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
-        super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attention = BaselineSelfAttention(d_model, num_heads)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn_in = nn.Linear(d_model, ffn_dim)
-        self.ffn_out = nn.Linear(ffn_dim, d_model)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-        causal: bool,
-    ) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), valid_token_mask, causal)
-        x = x + self.ffn_out(F.gelu(self.ffn_in(self.norm2(x)), approximate="none"))
-
-        if valid_token_mask is not None:
-            x = x.masked_fill(~valid_token_mask[..., None], 0)
-        return x
-
-
-class BaselineTransformer(nn.Module):
-    def __init__(self, config: TransformerConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.layers = nn.ModuleList(
-            [
-                BaselineTransformerBlock(
-                    config.d_model, config.num_heads, config.ffn_dim
-                )
-                for _ in range(config.num_layers)
-            ]
-        )
-        self.final_norm = nn.LayerNorm(config.d_model)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x, valid_token_mask, self.config.causal)
-        x = self.final_norm(x)
-        if valid_token_mask is not None:
-            x = x.masked_fill(~valid_token_mask[..., None], 0)
-        return x # Return tensor with shape [batch_size, seq_len, d_model]
-
-
-class UserOptimizedTransformer(BaselineTransformer):
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor: # Func sig cannot be changed
-        return super().forward(x, valid_token_mask)
-
-
-def copy_model_weights(
-    baseline: nn.Module, optimized: nn.Module, strict: bool = True
-) -> None: # We will not mod this so all Transformer model param names (e.g. self.q_proj) will be kept the same
-    """Copy identical weights into both implementations for a fair comparison."""
-    state_dict = copy.deepcopy(baseline.state_dict()) # baseline.state_dict() gives state of BaselineTransformer mod and all its registered submods
-    incompatible = optimized.load_state_dict(state_dict, strict=strict)
-    if not strict:
-        if incompatible.missing_keys:
-            print(f"[warning] missing optimized keys: {incompatible.missing_keys}")
-        if incompatible.unexpected_keys:
-            print(f"[warning] unexpected optimized keys: {incompatible.unexpected_keys}")
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_arg)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False")
-    return device
-
-
-def resolve_dtype(dtype_name: str) -> torch.dtype:
-    mapping = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    return mapping[dtype_name]
-
-
+# Gen Rand Test Case (used by run_accuracy_tests and benchmark_models)
 def generate_random_case(
     config: TransformerConfig,
     device: torch.device,
@@ -253,90 +204,7 @@ def generate_random_case(
     return x, valid_token_mask
 
 
-@dataclass
-class AccuracyResult:
-    passed: bool
-    total_elements: int
-    failed_elements: int
-    max_abs_error: float
-    max_relative_error: float
-    mean_abs_error: float
-    failed_feature_dims: List[int]
-    worst_index: Tuple[int, ...]
-    reference_at_worst: float
-    optimized_at_worst: float
-
-
-def compare_outputs(
-    reference: torch.Tensor,
-    optimized: torch.Tensor,
-    rtol: float,
-    atol: float,
-) -> AccuracyResult:
-    if reference.shape != optimized.shape:
-        raise AssertionError(
-            f"shape mismatch: baseline={tuple(reference.shape)}, "
-            f"optimized={tuple(optimized.shape)}"
-        )
-    if reference.dtype != optimized.dtype:
-        print(
-            f"[warning] dtype mismatch: baseline={reference.dtype}, "
-            f"optimized={optimized.dtype}"
-        )
-
-    ref = reference.detach().float()
-    opt = optimized.detach().float()
-
-    finite_mask = torch.isfinite(ref) & torch.isfinite(opt)
-    abs_error = (opt - ref).abs()
-
-    # Exact interpretation of the requested OR condition. torch.isclose uses
-    # atol + rtol * abs(ref), which is slightly more permissive and is not used.
-    abs_ok = abs_error <= atol
-    rel_ok = abs_error <= rtol * ref.abs()
-    passed_mask = finite_mask & (abs_ok | rel_ok)
-
-    failed_mask = ~passed_mask
-    failed_elements = int(failed_mask.sum().item())
-    total_elements = reference.numel()
-
-    flat_worst = int(abs_error.reshape(-1).argmax().item())
-    worst_index_list = []
-    remaining = flat_worst
-    for size in reversed(reference.shape):
-        worst_index_list.append(remaining % size)
-        remaining //= size
-    worst_index = tuple(reversed(worst_index_list))
-
-    denominator = ref.abs().clamp_min(1e-12)
-    relative_error = abs_error / denominator
-
-    # Summarize failures by the last/output-feature dimension.
-    if reference.ndim == 0:
-        failed_feature_dims = [0] if failed_elements else []
-    elif reference.ndim == 1:
-        failed_feature_dims = torch.nonzero(failed_mask, as_tuple=False).flatten().tolist()
-    else:
-        reduce_dims = tuple(range(reference.ndim - 1))
-        failed_by_feature = failed_mask.any(dim=reduce_dims)
-        failed_feature_dims = (
-            torch.nonzero(failed_by_feature, as_tuple=False).flatten().tolist()
-        )
-
-    return AccuracyResult(
-        passed=failed_elements == 0,
-        total_elements=total_elements,
-        failed_elements=failed_elements,
-        max_abs_error=float(abs_error.max().item()),
-        max_relative_error=float(relative_error.max().item()),
-        mean_abs_error=float(abs_error.mean().item()),
-        failed_feature_dims=failed_feature_dims,
-        worst_index=worst_index,
-        reference_at_worst=float(ref[worst_index].item()),
-        optimized_at_worst=float(opt[worst_index].item()),
-    )
-
-
+# Run Accuracy Tests
 def run_accuracy_tests(
     baseline: nn.Module,
     optimized: nn.Module,
@@ -350,6 +218,90 @@ def run_accuracy_tests(
     rtol: float,
     atol: float,
 ) -> bool:
+    @dataclass
+    class AccuracyResult:
+        passed: bool
+        total_elements: int
+        failed_elements: int
+        max_abs_error: float
+        max_relative_error: float
+        mean_abs_error: float
+        failed_feature_dims: List[int]
+        worst_index: Tuple[int, ...]
+        reference_at_worst: float
+        optimized_at_worst: float
+
+
+    def compare_outputs(
+        reference: torch.Tensor,
+        optimized: torch.Tensor,
+        rtol: float,
+        atol: float,
+    ) -> AccuracyResult:
+        if reference.shape != optimized.shape:
+            raise AssertionError(
+                f"shape mismatch: baseline={tuple(reference.shape)}, "
+                f"optimized={tuple(optimized.shape)}"
+            )
+        if reference.dtype != optimized.dtype:
+            print(
+                f"[warning] dtype mismatch: baseline={reference.dtype}, "
+                f"optimized={optimized.dtype}"
+            )
+
+        ref = reference.detach().float()
+        opt = optimized.detach().float()
+
+        finite_mask = torch.isfinite(ref) & torch.isfinite(opt)
+        abs_error = (opt - ref).abs()
+
+        # Exact interpretation of the requested OR condition. torch.isclose uses
+        # atol + rtol * abs(ref), which is slightly more permissive and is not used.
+        abs_ok = abs_error <= atol
+        rel_ok = abs_error <= rtol * ref.abs()
+        passed_mask = finite_mask & (abs_ok | rel_ok)
+
+        failed_mask = ~passed_mask
+        failed_elements = int(failed_mask.sum().item())
+        total_elements = reference.numel()
+
+        flat_worst = int(abs_error.reshape(-1).argmax().item())
+        worst_index_list = []
+        remaining = flat_worst
+        for size in reversed(reference.shape):
+            worst_index_list.append(remaining % size)
+            remaining //= size
+        worst_index = tuple(reversed(worst_index_list))
+
+        denominator = ref.abs().clamp_min(1e-12)
+        relative_error = abs_error / denominator
+
+        # Summarize failures by the last/output-feature dimension.
+        if reference.ndim == 0:
+            failed_feature_dims = [0] if failed_elements else []
+        elif reference.ndim == 1:
+            failed_feature_dims = torch.nonzero(failed_mask, as_tuple=False).flatten().tolist()
+        else:
+            reduce_dims = tuple(range(reference.ndim - 1))
+            failed_by_feature = failed_mask.any(dim=reduce_dims)
+            failed_feature_dims = (
+                torch.nonzero(failed_by_feature, as_tuple=False).flatten().tolist()
+            )
+
+        return AccuracyResult(
+            passed=failed_elements == 0,
+            total_elements=total_elements,
+            failed_elements=failed_elements,
+            max_abs_error=float(abs_error.max().item()),
+            max_relative_error=float(relative_error.max().item()),
+            mean_abs_error=float(abs_error.mean().item()),
+            failed_feature_dims=failed_feature_dims,
+            worst_index=worst_index,
+            reference_at_worst=float(ref[worst_index].item()),
+            optimized_at_worst=float(opt[worst_index].item()),
+        )
+
+
     print("\n=== Accuracy check ===")
     print(f"criterion: abs_error <= {atol:g} OR relative_error <= {rtol:.2%}")
 
@@ -405,90 +357,7 @@ def run_accuracy_tests(
     return all_passed
 
 
-def percentile(values: List[float], q: float) -> float:
-    if not values:
-        raise ValueError("values must not be empty")
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    position = (len(ordered) - 1) * q
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return ordered[lower]
-    weight = position - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-
-@dataclass
-class TimingResult:
-    samples_ms: List[float]
-
-    @property
-    def mean_ms(self) -> float:
-        return statistics.fmean(self.samples_ms)
-
-    @property
-    def median_ms(self) -> float:
-        return statistics.median(self.samples_ms)
-
-    @property
-    def p90_ms(self) -> float:
-        return percentile(self.samples_ms, 0.90)
-
-    @property
-    def min_ms(self) -> float:
-        return min(self.samples_ms)
-
-
-def warmup_model(
-    model: nn.Module,
-    x: torch.Tensor,
-    valid_mask: torch.Tensor,
-    iterations: int,
-    device: torch.device,
-) -> None:
-    with torch.inference_mode():
-        for _ in range(iterations):
-            model(x, valid_mask)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def benchmark_once(
-    model: nn.Module,
-    x: torch.Tensor,
-    valid_mask: torch.Tensor,
-    iterations: int,
-    device: torch.device,
-) -> List[float]:
-    samples_ms: List[float] = []
-
-    with torch.inference_mode():
-        if device.type == "cuda":
-            starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
-            ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
-
-            torch.cuda.synchronize(device)
-            for index in range(iterations):
-                starts[index].record()
-                model(x, valid_mask)
-                ends[index].record()
-            torch.cuda.synchronize(device)
-
-            samples_ms.extend(
-                start.elapsed_time(end) for start, end in zip(starts, ends)
-            )
-        else:
-            for _ in range(iterations):
-                start = time.perf_counter_ns()
-                model(x, valid_mask)
-                end = time.perf_counter_ns()
-                samples_ms.append((end - start) / 1e6)
-
-    return samples_ms
-
-
+# Benchmark Models
 def benchmark_models(
     baseline: nn.Module,
     optimized: nn.Module,
@@ -502,6 +371,90 @@ def benchmark_models(
     repeats: int,
     rounds: int,
 ) -> None:
+    def warmup_model(
+        model: nn.Module,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor,
+        iterations: int,
+        device: torch.device,
+    ) -> None:
+        with torch.inference_mode():
+            for _ in range(iterations):
+                model(x, valid_mask)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+
+    def benchmark_once(
+        model: nn.Module,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor,
+        iterations: int,
+        device: torch.device,
+    ) -> List[float]:
+        samples_ms: List[float] = []
+
+        with torch.inference_mode():
+            if device.type == "cuda":
+                starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+                ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+
+                torch.cuda.synchronize(device)
+                for index in range(iterations):
+                    starts[index].record()
+                    model(x, valid_mask)
+                    ends[index].record()
+                torch.cuda.synchronize(device)
+
+                samples_ms.extend(
+                    start.elapsed_time(end) for start, end in zip(starts, ends)
+                )
+            else:
+                for _ in range(iterations):
+                    start = time.perf_counter_ns()
+                    model(x, valid_mask)
+                    end = time.perf_counter_ns()
+                    samples_ms.append((end - start) / 1e6)
+
+        return samples_ms
+
+
+    @dataclass
+    class TimingResult:
+        samples_ms: List[float]
+
+        @property
+        def mean_ms(self) -> float:
+            return statistics.fmean(self.samples_ms)
+
+        @property
+        def median_ms(self) -> float:
+            return statistics.median(self.samples_ms)
+
+        @property
+        def p90_ms(self) -> float:
+            def _percentile(values: List[float], q: float) -> float:
+                if not values:
+                    raise ValueError("values must not be empty")
+                ordered = sorted(values)
+                if len(ordered) == 1:
+                    return ordered[0]
+                position = (len(ordered) - 1) * q
+                lower = math.floor(position)
+                upper = math.ceil(position)
+                if lower == upper:
+                    return ordered[lower]
+                weight = position - lower
+                return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+            return _percentile(self.samples_ms, 0.90)
+
+        @property
+        def min_ms(self) -> float:
+            return min(self.samples_ms)
+
+
     print("\n=== Performance benchmark ===")
     print("timing excludes random-data generation and uses a fixed input")
     if device.type == "cuda":
@@ -561,93 +514,142 @@ def benchmark_models(
         f"min={optimized_result.min_ms:.4f} ms | "
         f"throughput={optimized_tokens_per_second:.2f} token/s"
     )
-    print(f"speedup  : {speedup:.3f}x based on median latency")
+    print(f"Speedup (based on median latency): {speedup:.3f}x")
 
 
-def maybe_compile(model: nn.Module, enabled: bool, mode: str) -> nn.Module:
-    if not enabled:
-        return model
-    if not hasattr(torch, "compile"):
-        raise RuntimeError("this PyTorch build does not provide torch.compile")
-    return torch.compile(model, mode=mode)
+class BaselineTransformer(nn.Module): # nn.Module is base class
+    class BaselineTransformerBlock(nn.Module):
+        class BaselineSelfAttention(nn.Module):
+            """Explicit multi-head self-attention implemented with native PyTorch ops."""
+
+            def __init__(self, d_model: int, num_heads: int) -> None:
+                super().__init__()
+                if d_model % num_heads != 0:
+                    raise ValueError("d_model must be divisible by num_heads")
+
+                self.d_model = d_model
+                self.num_heads = num_heads
+                self.head_dim = d_model // num_heads
+                self.scale = self.head_dim**-0.5
+
+                self.q_proj = nn.Linear(d_model, d_model, bias=True)
+                self.k_proj = nn.Linear(d_model, d_model, bias=True)
+                self.v_proj = nn.Linear(d_model, d_model, bias=True)
+                self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+            def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+                batch, seq_len, _ = x.shape
+                return (
+                    x.view(batch, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+            def forward(
+                self,
+                x: torch.Tensor,
+                valid_token_mask: Optional[torch.Tensor] = None,
+                causal: bool = False,
+            ) -> torch.Tensor:
+                batch, seq_len, _ = x.shape
+
+                q = self._split_heads(self.q_proj(x))
+                k = self._split_heads(self.k_proj(x))
+                v = self._split_heads(self.v_proj(x))
+
+                scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+                if causal:
+                    causal_mask = torch.ones(
+                        (seq_len, seq_len), device=x.device, dtype=torch.bool
+                    ).triu(diagonal=1)
+                    scores = scores.masked_fill(causal_mask, float("-inf"))
+
+                if valid_token_mask is not None:
+                    # Mask invalid key positions. Shape: [B, 1, 1, S].
+                    invalid_keys = ~valid_token_mask[:, None, None, :]
+                    scores = scores.masked_fill(invalid_keys, float("-inf"))
+
+                # Computing softmax in fp32 provides a stable reference for fp16/bf16 tests.
+                probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
+                context = torch.matmul(probs, v)
+                context = (
+                    context.transpose(1, 2)
+                    .contiguous()
+                    .view(batch, seq_len, self.d_model)
+                )
+                output = self.out_proj(context)
+
+                if valid_token_mask is not None:
+                    output = output.masked_fill(~valid_token_mask[..., None], 0)
+                return output
+
+        def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
+            super().__init__()
+            self.norm1 = nn.LayerNorm(d_model)
+            self.attention = self.BaselineSelfAttention(d_model, num_heads)
+            self.norm2 = nn.LayerNorm(d_model)
+            self.ffn_in = nn.Linear(d_model, ffn_dim)
+            self.ffn_out = nn.Linear(ffn_dim, d_model)
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            valid_token_mask: Optional[torch.Tensor],
+            causal: bool,
+        ) -> torch.Tensor:
+            x = x + self.attention(self.norm1(x), valid_token_mask, causal)
+            x = x + self.ffn_out(F.gelu(self.ffn_in(self.norm2(x)), approximate="none"))
+
+            if valid_token_mask is not None:
+                x = x.masked_fill(~valid_token_mask[..., None], 0)
+            return x
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            [
+                self.BaselineTransformerBlock(
+                    config.d_model, config.num_heads, config.ffn_dim
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(config.d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, valid_token_mask, self.config.causal)
+        x = self.final_norm(x)
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x # Return tensor with shape [batch_size, seq_len, d_model]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Compare a baseline and optimized PyTorch Transformer"
-    )
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--ffn-dim", type=int, default=2048)
-    parser.add_argument("--layers", type=int, default=6)
-    parser.add_argument("--causal", action="store_true")
-
-    parser.add_argument(
-        "--device", default="auto", help="auto, cpu, cuda, cuda:0, ..."
-    )
-    parser.add_argument(
-        "--dtype",
-        choices=("float32", "float16", "bfloat16"),
-        default="float32",
-    )
-    parser.add_argument("--padding-ratio", type=float, default=0.0)
-    parser.add_argument("--input-scale", type=float, default=1.0)
-
-    parser.add_argument("--accuracy-trials", type=int, default=5)
-    parser.add_argument("--rtol", type=float, default=0.01)
-    parser.add_argument("--atol", type=float, default=0.001)
-    parser.add_argument("--seed", type=int, default=1234)
-
-    parser.add_argument("--warmup", type=int, default=7)
-    parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--benchmark-rounds", type=int, default=2)
-    parser.add_argument("--benchmark-on-failure", action="store_true")
-
-    parser.add_argument("--compile-baseline", action="store_true")
-    parser.add_argument("--compile-user", action="store_true")
-    parser.add_argument(
-        "--compile-mode",
-        choices=("default", "reduce-overhead", "max-autotune"),
-        default="default",
-    )
-    parser.add_argument("--non-strict-weight-copy", action="store_true")
-    parser.add_argument(
-        "--matmul-precision",
-        choices=("highest", "high", "medium"),
-        default="high",
-    )
-    parser.add_argument(
-        "--allow-tf32",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="enable/disable TF32 on CUDA for both implementations",
-    )
-    return parser.parse_args()
+class UserOptimizedTransformer(BaselineTransformer):
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor: # Func sig cannot be changed
+        return super().forward(x, valid_token_mask)
 
 
-def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> None:
-    if not 0.0 <= args.padding_ratio < 1.0:
-        raise ValueError("padding_ratio must be in [0, 1)")
-    if args.input_scale <= 0:
-        raise ValueError("input_scale must be positive")
-    if args.accuracy_trials <= 0:
-        raise ValueError("accuracy_trials must be positive")
-    if args.rtol < 0 or args.atol < 0:
-        raise ValueError("rtol and atol must be non-negative")
-    if args.warmup < 0:
-        raise ValueError("warmup must be non-negative")
-    if args.repeats <= 0 or args.benchmark_rounds <= 0:
-        raise ValueError("repeats and benchmark_rounds must be positive")
-    if device.type == "cpu" and dtype == torch.float16:
-        print("[warning] float16 CPU kernels may be unsupported or slow")
-
-
+# Entry Pt
 def main() -> int:
+    # Start: Initial setup
     args = parse_args()
+    
     device = resolve_device(args.device)
+    
     dtype = resolve_dtype(args.dtype)
+
+    validate_some(args, device, dtype)
 
     config = TransformerConfig(
         batch_size=args.batch_size,
@@ -658,18 +660,36 @@ def main() -> int:
         num_layers=args.layers,
         causal=args.causal,
     )
-    config.validate()
-    validate_args(args, device, dtype)
 
+    config.validate()
+    # End: Initial setup
+
+    # Start: PyTorch setup
     torch.manual_seed(args.seed)
+    
     torch.set_float32_matmul_precision(args.matmul_precision)
+    
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
+    # End: PyTorch setup
+
+    # Start: Logging of setup info
+    print("=== Configuration ===")
+    
+    print(config)
+    
+    print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
+    
+    if device.type == "cuda":
+        print(f"gpu={torch.cuda.get_device_name(device)}")
+    # End: Logging of setup info
 
     baseline = BaselineTransformer(config)
+    
     optimized = UserOptimizedTransformer(config)
+    
     copy_model_weights(
         baseline,
         optimized,
@@ -677,17 +697,12 @@ def main() -> int:
     )
 
     baseline = baseline.to(device=device, dtype=dtype).eval()
+    
     optimized = optimized.to(device=device, dtype=dtype).eval()
 
-    # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
+    
     optimized = maybe_compile(optimized, args.compile_user, args.compile_mode)
-
-    print("=== Configuration ===")
-    print(config)
-    print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
-    if device.type == "cuda":
-        print(f"gpu={torch.cuda.get_device_name(device)}")
 
     accuracy_passed = run_accuracy_tests(
         baseline=baseline,
@@ -699,13 +714,15 @@ def main() -> int:
         seed=args.seed,
         padding_ratio=args.padding_ratio,
         input_scale=args.input_scale,
-        rtol=args.rtol,
-        atol=args.atol,
+        rtol=args.rtol, # Correct if abs(user - ref) <= rtol * abs(ref)
+        atol=args.atol, # Correct if abs(user - ref) <= atol
     )
 
     if not accuracy_passed and not args.benchmark_on_failure:
         print("\nPerformance benchmark skipped because accuracy validation failed.")
+        
         print("Use --benchmark-on-failure to benchmark an incorrect implementation anyway.")
+        
         return 2
 
     benchmark_models(
@@ -721,8 +738,10 @@ def main() -> int:
         repeats=args.repeats,
         rounds=args.benchmark_rounds,
     )
+
     return 0 if accuracy_passed else 2
 
 
+# Ensures this script is ran directly and not imported as a mod
 if __name__ == "__main__":
     raise SystemExit(main())
