@@ -26,6 +26,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# Set only after the CUDA backend beats the compiled PyTorch implementation by
+# at least 3% on the target GPU and passes the complete accuracy matrix.
+AUTO_CUDA_VALIDATED = False
+_cuda_extension = None
+
+
+def get_cuda_extension(required: bool = True):
+    """Load the ahead-of-time CUDA extension without compiling at runtime."""
+    global _cuda_extension
+    if _cuda_extension is not None:
+        return _cuda_extension
+    try:
+        import transformer_cuda_ext
+    except ImportError as error:
+        if required:
+            raise RuntimeError(
+                "The CUDA backend is not built. Run `make build-cuda` first."
+            ) from error
+        return None
+    _cuda_extension = transformer_cuda_ext
+    return _cuda_extension
+
+
 @dataclass(frozen=True)
 class TransformerConfig:
     batch_size: int
@@ -192,6 +215,7 @@ class OptimizedSelfAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         valid_token_mask: Optional[torch.Tensor],
         causal: bool,
+        include_output_bias: bool = True,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
@@ -211,7 +235,11 @@ class OptimizedSelfAttention(nn.Module):
             is_causal=causal,
         )
         context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
-        output = self.out_proj(context)
+        output = F.linear(
+            context,
+            self.out_proj.weight,
+            self.out_proj.bias if include_output_bias else None,
+        )
 
         if valid_token_mask is not None:
             output = output.masked_fill(~valid_token_mask[..., None], 0)
@@ -245,11 +273,12 @@ class OptimizedTransformerBlock(nn.Module):
 
 
 class UserOptimizedTransformer(nn.Module):
-    """Transformer with fused QKV projection and fused CUDA SDPA."""
+    """Transformer with fused QKV/SDPA and an optional custom CUDA backend."""
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(self, config: TransformerConfig, backend: str = "pytorch") -> None:
         super().__init__()
         self.config = config
+        self.backend = backend
         self.layers = nn.ModuleList(
             [
                 OptimizedTransformerBlock(
@@ -259,11 +288,14 @@ class UserOptimizedTransformer(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(config.d_model)
+        self.register_buffer(
+            "_empty_mask", torch.empty(0, dtype=torch.bool), persistent=False
+        )
 
-    def forward(
+    def _forward_pytorch(
         self,
         x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
+        valid_token_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         attention_mask: Optional[torch.Tensor] = None
 
@@ -273,8 +305,6 @@ class UserOptimizedTransformer(nn.Module):
             attention_mask = valid_token_mask[:, None, None, :]
 
         for layer in self.layers:
-            # Current SDPA supports combining its allocation-free causal path
-            # with a broadcast padding mask.
             x = layer(
                 x,
                 attention_mask,
@@ -285,6 +315,73 @@ class UserOptimizedTransformer(nn.Module):
         if valid_token_mask is not None:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
+
+    def _forward_cuda(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            raise RuntimeError("The custom CUDA backend supports inference only")
+        extension = get_cuda_extension(required=True)
+        mask = self._empty_mask
+        attention_mask: Optional[torch.Tensor] = None
+        if valid_token_mask is not None:
+            mask = valid_token_mask.contiguous()
+            attention_mask = mask[:, None, None, :]
+
+        # The first LayerNorm cannot be fused with a preceding block. Each
+        # subsequent norm is produced by the previous residual fusion.
+        normalized = self.layers[0].norm1(x)
+        for index, layer in enumerate(self.layers):
+            attention_delta = layer.attention(
+                normalized,
+                attention_mask,
+                valid_token_mask,
+                self.config.causal,
+                include_output_bias=False,
+            )
+            x, ffn_input = extension.residual_bias_layer_norm(
+                x,
+                attention_delta,
+                layer.attention.out_proj.bias,
+                layer.norm2.weight,
+                layer.norm2.bias,
+                mask,
+                layer.norm2.eps,
+                False,
+            )
+
+            hidden = F.linear(ffn_input, layer.ffn_in.weight, bias=None)
+            hidden = extension.bias_gelu(hidden, layer.ffn_in.bias)
+            ffn_delta = F.linear(hidden, layer.ffn_out.weight, bias=None)
+
+            last_layer = index + 1 == len(self.layers)
+            following_norm = (
+                self.final_norm if last_layer else self.layers[index + 1].norm1
+            )
+            x, normalized = extension.residual_bias_layer_norm(
+                x,
+                ffn_delta,
+                layer.ffn_out.bias,
+                following_norm.weight,
+                following_norm.bias,
+                mask,
+                following_norm.eps,
+                last_layer,
+            )
+        return normalized
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.backend == "cuda":
+            if not x.is_cuda or x.dtype != torch.float32:
+                raise RuntimeError("The custom backend requires CUDA float32 input")
+            return self._forward_cuda(x, valid_token_mask)
+        return self._forward_pytorch(x, valid_token_mask)
 
 
 def copy_model_weights(
@@ -353,6 +450,50 @@ def resolve_dtype(dtype_name: str) -> torch.dtype:
         "bfloat16": torch.bfloat16,
     }
     return mapping[dtype_name]
+
+
+def custom_cuda_shape_supported(
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> bool:
+    """Whether the shape-specialized RTX 5090 kernels can execute this case."""
+    return (
+        device.type == "cuda"
+        and dtype == torch.float32
+        and config.batch_size == 8
+        and config.seq_len == 128
+        and config.d_model == 512
+        and config.num_heads == 8
+        and config.ffn_dim == 2048
+        and config.num_layers == 6
+    )
+
+
+def resolve_optimized_backend(
+    requested: str,
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> str:
+    if requested == "pytorch":
+        return requested
+
+    supported = custom_cuda_shape_supported(config, device, dtype)
+    if requested == "cuda":
+        if not supported:
+            raise ValueError(
+                "--optimized-backend cuda requires CUDA float32 and the default "
+                "8x128x512, 8-head, 2048-FFN, 6-layer configuration"
+            )
+        get_cuda_extension(required=True)
+        return requested
+
+    # Auto remains conservative: an extension must be present, eligible, and
+    # have cleared the documented accuracy/performance gate on the target GPU.
+    if supported and AUTO_CUDA_VALIDATED and get_cuda_extension(required=False):
+        return "cuda"
+    return "pytorch"
 
 
 def generate_random_case(
@@ -781,6 +922,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-baseline", action="store_true")
     parser.add_argument("--compile-user", action="store_true")
     parser.add_argument(
+        "--optimized-backend",
+        choices=("auto", "pytorch", "cuda"),
+        default="auto",
+        help="auto uses only a CUDA backend that has passed the speed gate",
+    )
+    parser.add_argument(
         "--compile-mode",
         choices=("default", "reduce-overhead", "max-autotune"),
         default="default",
@@ -836,6 +983,9 @@ def main() -> int:
     )
     config.validate()
     validate_args(args, device, dtype)
+    optimized_backend = resolve_optimized_backend(
+        args.optimized_backend, config, device, dtype
+    )
 
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision(args.matmul_precision)
@@ -845,7 +995,7 @@ def main() -> int:
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
 
     baseline = BaselineTransformer(config)
-    optimized = UserOptimizedTransformer(config)
+    optimized = UserOptimizedTransformer(config, backend=optimized_backend)
     copy_model_weights(
         baseline,
         optimized,
@@ -857,11 +1007,22 @@ def main() -> int:
 
     # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
-    optimized = maybe_compile(optimized, args.compile_user, args.compile_mode)
+    compile_user = args.compile_user
+    if optimized_backend == "cuda" and compile_user:
+        print(
+            "[warning] --compile-user is ignored for the custom CUDA backend; "
+            "its fused kernels are already CUDA Graph-capture compatible"
+        )
+        compile_user = False
+    optimized = maybe_compile(optimized, compile_user, args.compile_mode)
 
     print("=== Configuration ===")
     print(config)
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
+    print(
+        f"optimized_backend={optimized_backend} "
+        f"(requested={args.optimized_backend})"
+    )
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
 
