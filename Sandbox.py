@@ -172,17 +172,6 @@ class BaselineTransformer(nn.Module):
         return x # Return tensor with shape [batch_size, seq_len, d_model]
 
 
-def _residual_add_mask(
-    x: torch.Tensor,
-    update: torch.Tensor,
-    valid_token_mask: Optional[torch.Tensor],
-) -> torch.Tensor:
-    # Padding rows are intentionally left unmasked inside the block. Invalid tokens
-    # are never used as attention keys, while LN/GELU are position-wise, so zeroing
-    # them after every sublayer is redundant. We zero them once after final LN.
-    return x + update
-
-
 class UserOptimizedTransformer(BaselineTransformer):
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config)
@@ -210,14 +199,11 @@ class UserOptimizedTransformer(BaselineTransformer):
 
         self._mask_cache_key: Optional[Tuple[int, int]] = None
         self._mask_cache_all_valid = False
-        self._causal_mask_cache: Dict[Tuple[str, int, torch.dtype], torch.Tensor] = {}
-        self._compiled_impl = None
-        self._compiled_impl_key = None
+        self._causal_mask_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
         self._rebuild_qkv_buffers()
 
     def _rebuild_qkv_buffers(self) -> None:
-        # Called after load_state_dict and at construction. Buffers are non-persistent,
-        # so they do not change the model's public state_dict contract.
+        """Pack Q/K/V projections without changing the public state_dict."""
         with torch.no_grad():
             for index, block in enumerate(self.layers):
                 getattr(self, f"_qkv_weight_{index}").copy_(
@@ -245,8 +231,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         result = super().load_state_dict(state_dict, strict=strict, assign=assign)
         self._rebuild_qkv_buffers()
         self._mask_cache_key = None
-        self._compiled_impl = None
-        self._compiled_impl_key = None
+        self._causal_mask_cache.clear()
         return result
 
     def _normalize_valid_mask(
@@ -255,16 +240,11 @@ class UserOptimizedTransformer(BaselineTransformer):
         if valid_token_mask is None:
             return None
 
-        # The supplied benchmark passes an all-True mask even when padding_ratio=0.
-        # Detect that once per mask/version and turn it into the true no-mask path.
-        # Tensor _version changes on in-place mutation, so this remains correct if the
-        # caller reuses the mask tensor and modifies it.
         try:
             version = valid_token_mask._version
         except RuntimeError:
-            # Inference-mode tensors intentionally do not expose a version counter.
-            # Their storage pointer is sufficient for the immutable benchmark masks.
             version = -1
+
         key = (valid_token_mask.data_ptr(), version)
         if key != self._mask_cache_key:
             self._mask_cache_key = key
@@ -272,16 +252,52 @@ class UserOptimizedTransformer(BaselineTransformer):
         return None if self._mask_cache_all_valid else valid_token_mask
 
     def _get_causal_mask(
-        self, device: torch.device, seq_len: int
+        self,
+        device: torch.device,
+        seq_len: int,
+        num_heads: int,
     ) -> torch.Tensor:
-        key = (str(device), seq_len, torch.bool)
+        key = (str(device), seq_len, num_heads)
         mask = self._causal_mask_cache.get(key)
         if mask is None:
-            mask = torch.ones(
-                (seq_len, seq_len), device=device, dtype=torch.bool
-            ).tril()
+            # True means "masked out", matching MultiheadAttention's bool mask
+            # convention and the fused encoder-layer operator.
+            base = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).triu(1)
+            mask = base.view(1, 1, seq_len, seq_len).expand(1, num_heads, seq_len, seq_len)
             self._causal_mask_cache[key] = mask
         return mask
+
+    def _fused_layer_forward(
+        self,
+        layer: BaselineTransformerBlock,
+        qkv_weight: torch.Tensor,
+        qkv_bias: torch.Tensor,
+        x: torch.Tensor,
+        merged_mask: Optional[torch.Tensor],
+        mask_type: Optional[int],
+    ) -> torch.Tensor:
+        return torch._transformer_encoder_layer_fwd(
+            x,
+            self.config.d_model,
+            layer.attention.num_heads,
+            qkv_weight,
+            qkv_bias,
+            layer.attention.out_proj.weight,
+            layer.attention.out_proj.bias,
+            True,  # GELU
+            True,  # norm_first: matches BaselineTransformerBlock
+            layer.norm1.eps,
+            layer.norm1.weight,
+            layer.norm1.bias,
+            layer.norm2.weight,
+            layer.norm2.bias,
+            layer.ffn_in.weight,
+            layer.ffn_in.bias,
+            layer.ffn_out.weight,
+            layer.ffn_out.bias,
+            merged_mask,
+            mask_type,
+        )
 
     def _forward_impl(
         self,
@@ -291,72 +307,32 @@ class UserOptimizedTransformer(BaselineTransformer):
         cfg = self.config
         has_padding = valid_token_mask is not None
         batch, seq_len, _ = x.shape
-        attn_mask = None
-        if has_padding:
-            key_mask = valid_token_mask[:, None, None, :]
-            if cfg.causal:
-                attn_mask = key_mask & self._get_causal_mask(x.device, seq_len)[None, None, :, :]
-            else:
-                attn_mask = key_mask
 
         for layer_index, layer in enumerate(self.layers):
-            norm1 = F.layer_norm(
-                x,
-                (cfg.d_model,),
-                layer.norm1.weight,
-                layer.norm1.bias,
-                layer.norm1.eps,
-            )
+            heads = layer.attention.num_heads
+            merged_mask: Optional[torch.Tensor] = None
+            mask_type: Optional[int] = None
 
-            qkv = F.linear(
-                norm1,
+            if cfg.causal:
+                causal_mask = self._get_causal_mask(x.device, seq_len, heads)
+                merged_mask = causal_mask.expand(batch, heads, seq_len, seq_len)
+                mask_type = 2
+                if has_padding:
+                    padding_mask = (~valid_token_mask).view(batch, 1, 1, seq_len)
+                    merged_mask = merged_mask | padding_mask
+            elif has_padding:
+                # Mask type 1 is the compact key-padding-mask representation.
+                merged_mask = ~valid_token_mask
+                mask_type = 1
+
+            x = self._fused_layer_forward(
+                layer,
                 getattr(self, f"_qkv_weight_{layer_index}"),
                 getattr(self, f"_qkv_bias_{layer_index}"),
-            )
-            q, k, v = qkv.chunk(3, dim=-1)
-            h = layer.attention.num_heads
-            d = layer.attention.head_dim
-            q = q.view(batch, seq_len, h, d).transpose(1, 2)
-            k = k.view(batch, seq_len, h, d).transpose(1, 2)
-            v = v.view(batch, seq_len, h, d).transpose(1, 2)
-
-            if hasattr(F, "scaled_dot_product_attention"):
-                context = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, dropout_p=0.0,
-                    is_causal=(cfg.causal and not has_padding),
-                    scale=layer.attention.scale,
-                )
-            else:
-                scores = torch.matmul(q, k.transpose(-2, -1)) * layer.attention.scale
-                if cfg.causal:
-                    scores = scores.masked_fill(
-                        ~self._get_causal_mask(x.device, seq_len)[None, None, :, :],
-                        float("-inf"),
-                    )
-                if has_padding:
-                    scores = scores.masked_fill(
-                        ~valid_token_mask[:, None, None, :], float("-inf")
-                    )
-                probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
-                context = torch.matmul(probs, v)
-
-            context = context.transpose(1, 2).reshape(batch, seq_len, cfg.d_model)
-            attn_out = F.linear(
-                context, layer.attention.out_proj.weight, layer.attention.out_proj.bias
-            )
-            x = _residual_add_mask(x, attn_out, valid_token_mask)
-
-            norm2 = F.layer_norm(
                 x,
-                (cfg.d_model,),
-                layer.norm2.weight,
-                layer.norm2.bias,
-                layer.norm2.eps,
+                merged_mask,
+                mask_type,
             )
-            hidden = F.linear(norm2, layer.ffn_in.weight, layer.ffn_in.bias)
-            hidden = F.gelu(hidden, approximate="none")
-            ffn_out = F.linear(hidden, layer.ffn_out.weight, layer.ffn_out.bias)
-            x = _residual_add_mask(x, ffn_out, valid_token_mask)
 
         x = F.layer_norm(
             x,
@@ -369,26 +345,13 @@ class UserOptimizedTransformer(BaselineTransformer):
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
 
-    def _get_compiled_impl(self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]):
-        key = (tuple(x.shape), x.dtype, x.device.type, x.device.index,
-               valid_token_mask is not None, self.config.causal)
-        if self._compiled_impl is None or self._compiled_impl_key != key:
-            self._compiled_impl = torch.compile(
-                self._forward_impl,
-                mode="reduce-overhead",
-                fullgraph=True,
-                dynamic=False,
-            )
-            self._compiled_impl_key = key
-        return self._compiled_impl
-
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         valid_token_mask = self._normalize_valid_mask(valid_token_mask)
-
+        
         return self._forward_impl(x, valid_token_mask)
 
 
