@@ -193,193 +193,138 @@ class UserOptimizedTransformerBlock(nn.Module):
 
 
 class UserOptimizedTransformer(nn.Module):
-    """Standalone high-performance Transformer.
-
-    It owns its own blocks, attention implementation, packed QKV buffers and
-    masking logic. It deliberately does not subclass or reference either
-    BaselineTransformerBlock or BaselineSelfAttention.
-    """
+    """Standalone transformer optimized for median inference latency."""
 
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [
-                UserOptimizedTransformerBlock(
-                    config.d_model, config.num_heads, config.ffn_dim
-                )
-                for _ in range(config.num_layers)
-            ]
+            UserOptimizedTransformerBlock(config.d_model, config.num_heads, config.ffn_dim)
+            for _ in range(config.num_layers)
         )
         self.final_norm = nn.LayerNorm(config.d_model)
-
-        # Keep these at transformer scope, matching the tight path used by
-        # the previous fast implementation and avoiding nested module lookups.
-        for index, layer in enumerate(self.layers):
-            self.register_buffer(
-                f"_qkv_weight_{index}",
-                torch.empty(
-                    3 * config.d_model,
-                    config.d_model,
-                    dtype=layer.q_proj.weight.dtype,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                f"_qkv_bias_{index}",
-                torch.empty(
-                    3 * config.d_model,
-                    dtype=layer.q_proj.bias.dtype,
-                ),
-                persistent=False,
-            )
-
+        self._d_model = config.d_model
+        self._num_heads = config.num_heads
+        self.register_buffer(
+            "_qkv_weights",
+            torch.empty(config.num_layers, 3 * config.d_model, config.d_model,
+                        dtype=self.layers[0].q_proj.weight.dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_qkv_biases",
+            torch.empty(config.num_layers, 3 * config.d_model,
+                        dtype=self.layers[0].q_proj.bias.dtype),
+            persistent=False,
+        )
         self._mask_cache_key: Optional[Tuple[int, int]] = None
         self._mask_cache_all_valid = False
-        self._causal_mask_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
+        self._causal_mask_cache: Dict[Tuple[torch.device, int], torch.Tensor] = {}
         self._rebuild_qkv_buffers()
 
     @torch.no_grad()
     def _rebuild_qkv_buffers(self) -> None:
-        for index, layer in enumerate(self.layers):
-            getattr(self, f"_qkv_weight_{index}").copy_(
-                torch.cat(
-                    (layer.q_proj.weight, layer.k_proj.weight, layer.v_proj.weight),
-                    dim=0,
-                )
-            )
-            getattr(self, f"_qkv_bias_{index}").copy_(
-                torch.cat((layer.q_proj.bias, layer.k_proj.bias, layer.v_proj.bias), dim=0)
-            )
+        d = self._d_model
+        for i, layer in enumerate(self.layers):
+            self._qkv_weights[i, :d].copy_(layer.q_proj.weight)
+            self._qkv_weights[i, d:2 * d].copy_(layer.k_proj.weight)
+            self._qkv_weights[i, 2 * d:].copy_(layer.v_proj.weight)
+            self._qkv_biases[i, :d].copy_(layer.q_proj.bias)
+            self._qkv_biases[i, d:2 * d].copy_(layer.k_proj.bias)
+            self._qkv_biases[i, 2 * d:].copy_(layer.v_proj.bias)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        # Accept existing baseline checkpoints:
-        # layers.N.attention.{q_proj,k_proj,v_proj,out_proj}.*
         remapped = state_dict.copy()
-        for key in list(remapped.keys()):
+        for key in list(remapped):
             if key.startswith("layers.") and ".attention." in key:
                 new_key = key.replace(".attention.", ".", 1)
                 if new_key not in remapped:
                     remapped[new_key] = remapped[key]
                 del remapped[key]
-
         result = super().load_state_dict(remapped, strict=strict, assign=assign)
         self._rebuild_qkv_buffers()
         self._mask_cache_key = None
         self._causal_mask_cache.clear()
         return result
 
-    def _normalize_valid_mask(
-        self, valid_token_mask: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
+    def _normalize_valid_mask(self, valid_token_mask: Optional[torch.Tensor]):
         if valid_token_mask is None:
             return None
-
         try:
             version = valid_token_mask._version
         except RuntimeError:
             version = -1
-
         key = (valid_token_mask.data_ptr(), version)
         if key != self._mask_cache_key:
             self._mask_cache_key = key
             self._mask_cache_all_valid = bool(valid_token_mask.all().item())
         return None if self._mask_cache_all_valid else valid_token_mask
 
-    def _get_causal_mask(
-        self,
-        device: torch.device,
-        seq_len: int,
-        num_heads: int,
-    ) -> torch.Tensor:
-        key = (str(device), seq_len, num_heads)
+    def _get_causal_mask(self, device: torch.device, seq_len: int) -> torch.Tensor:
+        key = (device, seq_len)
         mask = self._causal_mask_cache.get(key)
         if mask is None:
-            base = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).triu(1)
-            mask = base.view(1, 1, seq_len, seq_len).expand(
-                1, num_heads, seq_len, seq_len
+            mask = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).triu(1)
+            self._causal_mask_cache[key] = mask.view(1, 1, seq_len, seq_len).expand(
+                1, self._num_heads, seq_len, seq_len
             )
-            self._causal_mask_cache[key] = mask
         return mask
 
-    def attention(
-        self,
-        layer_index: int,
-        x: torch.Tensor,
-        merged_mask: Optional[torch.Tensor],
-        mask_type: Optional[int],
-    ) -> torch.Tensor:
-        """Own attention/block path using PyTorch's fused encoder kernel.
-
-        The kernel performs attention, residual connections, LayerNorm and FFN
-        together. This avoids the extra eager operations introduced by a
-        hand-written SDPA + FFN implementation while remaining independent of
-        the baseline classes.
-        """
-        layer = self.layers[layer_index]
+    def attention(self, i: int, x: torch.Tensor,
+                  mask: Optional[torch.Tensor], mask_type: Optional[int]) -> torch.Tensor:
+        layer = self.layers[i]
         return torch._transformer_encoder_layer_fwd(
-            x,
-            self.config.d_model,
-            layer.num_heads,
-            getattr(self, f"_qkv_weight_{layer_index}"),
-            getattr(self, f"_qkv_bias_{layer_index}"),
-            layer.out_proj.weight,
-            layer.out_proj.bias,
-            True,
-            True,
-            layer.norm1.eps,
-            layer.norm1.weight,
-            layer.norm1.bias,
-            layer.norm2.weight,
-            layer.norm2.bias,
-            layer.ffn_in.weight,
-            layer.ffn_in.bias,
-            layer.ffn_out.weight,
-            layer.ffn_out.bias,
-            merged_mask,
-            mask_type,
+            x, self._d_model, self._num_heads,
+            self._qkv_weights[i], self._qkv_biases[i],
+            layer.out_proj.weight, layer.out_proj.bias,
+            True, True,
+            layer.norm1.eps, layer.norm1.weight, layer.norm1.bias,
+            layer.norm2.weight, layer.norm2.bias,
+            layer.ffn_in.weight, layer.ffn_in.bias,
+            layer.ffn_out.weight, layer.ffn_out.bias,
+            mask, mask_type,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def _forward_no_mask(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_layers(x, None, None)
+
+    def _forward_layers(self, x: torch.Tensor,
+                        mask: Optional[torch.Tensor],
+                        mask_type: Optional[int]) -> torch.Tensor:
+        for i in range(len(self.layers)):
+            x = self.attention(i, x, mask, mask_type)
+        return x
+
+    def forward(self, x: torch.Tensor,
+                valid_token_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         valid_token_mask = self._normalize_valid_mask(valid_token_mask)
         cfg = self.config
         has_padding = valid_token_mask is not None
-        batch, seq_len, _ = x.shape
 
-        for layer_index in range(cfg.num_layers):
-            layer = self.layers[layer_index]
-            merged_mask: Optional[torch.Tensor] = None
-            mask_type: Optional[int] = None
-
+        if not cfg.causal and not has_padding:
+            x = self._forward_no_mask(x)
+        else:
+            batch, seq_len, _ = x.shape
+            mask_type = None
             if cfg.causal:
-                causal_mask = self._get_causal_mask(
-                    x.device, seq_len, layer.num_heads
-                )
-                merged_mask = causal_mask.expand(batch, layer.num_heads, seq_len, seq_len)
-                mask_type = 2
+                mask = self._get_causal_mask(x.device, seq_len)
+                mask = mask.expand(batch, self._num_heads, seq_len, seq_len)
                 if has_padding:
-                    padding_mask = (~valid_token_mask).view(batch, 1, 1, seq_len)
-                    merged_mask = merged_mask | padding_mask
-            elif has_padding:
-                merged_mask = ~valid_token_mask
+                    mask = mask | (~valid_token_mask).view(batch, 1, 1, seq_len)
+                mask_type = 2
+            else:
+                mask = ~valid_token_mask
                 mask_type = 1
-
-            x = self.attention(layer_index, x, merged_mask, mask_type)
+            x = self._forward_layers(x, mask, mask_type)
 
         x = F.layer_norm(
-            x,
-            (cfg.d_model,),
-            self.final_norm.weight,
-            self.final_norm.bias,
-            self.final_norm.eps,
+            x, (self._d_model,), self.final_norm.weight,
+            self.final_norm.bias, self.final_norm.eps
         )
         if has_padding:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
+
 
 def copy_model_weights(
     baseline: nn.Module, optimized: nn.Module, strict: bool = True
