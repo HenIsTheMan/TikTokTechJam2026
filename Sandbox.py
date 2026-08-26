@@ -172,19 +172,56 @@ class BaselineTransformer(nn.Module):
         return x # Return tensor with shape [batch_size, seq_len, d_model]
 
 
-class UserOptimizedTransformer(BaselineTransformer):
-    def __init__(self, config: TransformerConfig) -> None:
-        super().__init__(config)
+class UserOptimizedTransformerBlock(nn.Module):
+    """Standalone transformer block containing only optimized parameters."""
 
-        self._qkv_weight_buffers: List[torch.Tensor] = []
-        self._qkv_bias_buffers: List[torch.Tensor] = []
-        for index, block in enumerate(self.layers):
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.norm1 = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=True)
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn_in = nn.Linear(d_model, ffn_dim)
+        self.ffn_out = nn.Linear(ffn_dim, d_model)
+
+
+class UserOptimizedTransformer(nn.Module):
+    """Standalone high-performance Transformer.
+
+    It owns its own blocks, attention implementation, packed QKV buffers and
+    masking logic. It deliberately does not subclass or reference either
+    BaselineTransformerBlock or BaselineSelfAttention.
+    """
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            [
+                UserOptimizedTransformerBlock(
+                    config.d_model, config.num_heads, config.ffn_dim
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(config.d_model)
+
+        # Keep these at transformer scope, matching the tight path used by
+        # the previous fast implementation and avoiding nested module lookups.
+        for index, layer in enumerate(self.layers):
             self.register_buffer(
                 f"_qkv_weight_{index}",
                 torch.empty(
                     3 * config.d_model,
                     config.d_model,
-                    dtype=block.attention.q_proj.weight.dtype,
+                    dtype=layer.q_proj.weight.dtype,
                 ),
                 persistent=False,
             )
@@ -192,7 +229,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                 f"_qkv_bias_{index}",
                 torch.empty(
                     3 * config.d_model,
-                    dtype=block.attention.q_proj.bias.dtype,
+                    dtype=layer.q_proj.bias.dtype,
                 ),
                 persistent=False,
             )
@@ -202,33 +239,31 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._causal_mask_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
         self._rebuild_qkv_buffers()
 
+    @torch.no_grad()
     def _rebuild_qkv_buffers(self) -> None:
-        """Pack Q/K/V projections without changing the public state_dict."""
-        with torch.no_grad():
-            for index, block in enumerate(self.layers):
-                getattr(self, f"_qkv_weight_{index}").copy_(
-                    torch.cat(
-                        (
-                            block.attention.q_proj.weight,
-                            block.attention.k_proj.weight,
-                            block.attention.v_proj.weight,
-                        ),
-                        dim=0,
-                    )
+        for index, layer in enumerate(self.layers):
+            getattr(self, f"_qkv_weight_{index}").copy_(
+                torch.cat(
+                    (layer.q_proj.weight, layer.k_proj.weight, layer.v_proj.weight),
+                    dim=0,
                 )
-                getattr(self, f"_qkv_bias_{index}").copy_(
-                    torch.cat(
-                        (
-                            block.attention.q_proj.bias,
-                            block.attention.k_proj.bias,
-                            block.attention.v_proj.bias,
-                        ),
-                        dim=0,
-                    )
-                )
+            )
+            getattr(self, f"_qkv_bias_{index}").copy_(
+                torch.cat((layer.q_proj.bias, layer.k_proj.bias, layer.v_proj.bias), dim=0)
+            )
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        # Accept existing baseline checkpoints:
+        # layers.N.attention.{q_proj,k_proj,v_proj,out_proj}.*
+        remapped = state_dict.copy()
+        for key in list(remapped.keys()):
+            if key.startswith("layers.") and ".attention." in key:
+                new_key = key.replace(".attention.", ".", 1)
+                if new_key not in remapped:
+                    remapped[new_key] = remapped[key]
+                del remapped[key]
+
+        result = super().load_state_dict(remapped, strict=strict, assign=assign)
         self._rebuild_qkv_buffers()
         self._mask_cache_key = None
         self._causal_mask_cache.clear()
@@ -260,32 +295,38 @@ class UserOptimizedTransformer(BaselineTransformer):
         key = (str(device), seq_len, num_heads)
         mask = self._causal_mask_cache.get(key)
         if mask is None:
-            # True means "masked out", matching MultiheadAttention's bool mask
-            # convention and the fused encoder-layer operator.
             base = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).triu(1)
-            mask = base.view(1, 1, seq_len, seq_len).expand(1, num_heads, seq_len, seq_len)
+            mask = base.view(1, 1, seq_len, seq_len).expand(
+                1, num_heads, seq_len, seq_len
+            )
             self._causal_mask_cache[key] = mask
         return mask
 
-    def _fused_layer_forward(
+    def attention(
         self,
-        layer: BaselineTransformerBlock,
-        qkv_weight: torch.Tensor,
-        qkv_bias: torch.Tensor,
+        layer_index: int,
         x: torch.Tensor,
         merged_mask: Optional[torch.Tensor],
         mask_type: Optional[int],
     ) -> torch.Tensor:
+        """Own attention/block path using PyTorch's fused encoder kernel.
+
+        The kernel performs attention, residual connections, LayerNorm and FFN
+        together. This avoids the extra eager operations introduced by a
+        hand-written SDPA + FFN implementation while remaining independent of
+        the baseline classes.
+        """
+        layer = self.layers[layer_index]
         return torch._transformer_encoder_layer_fwd(
             x,
             self.config.d_model,
-            layer.attention.num_heads,
-            qkv_weight,
-            qkv_bias,
-            layer.attention.out_proj.weight,
-            layer.attention.out_proj.bias,
-            True,  # GELU
-            True,  # norm_first: matches BaselineTransformerBlock
+            layer.num_heads,
+            getattr(self, f"_qkv_weight_{layer_index}"),
+            getattr(self, f"_qkv_bias_{layer_index}"),
+            layer.out_proj.weight,
+            layer.out_proj.bias,
+            True,
+            True,
             layer.norm1.eps,
             layer.norm1.weight,
             layer.norm1.bias,
@@ -299,40 +340,35 @@ class UserOptimizedTransformer(BaselineTransformer):
             mask_type,
         )
 
-    def _forward_impl(
+    def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        valid_token_mask = self._normalize_valid_mask(valid_token_mask)
         cfg = self.config
         has_padding = valid_token_mask is not None
         batch, seq_len, _ = x.shape
 
-        for layer_index, layer in enumerate(self.layers):
-            heads = layer.attention.num_heads
+        for layer_index in range(cfg.num_layers):
+            layer = self.layers[layer_index]
             merged_mask: Optional[torch.Tensor] = None
             mask_type: Optional[int] = None
 
             if cfg.causal:
-                causal_mask = self._get_causal_mask(x.device, seq_len, heads)
-                merged_mask = causal_mask.expand(batch, heads, seq_len, seq_len)
+                causal_mask = self._get_causal_mask(
+                    x.device, seq_len, layer.num_heads
+                )
+                merged_mask = causal_mask.expand(batch, layer.num_heads, seq_len, seq_len)
                 mask_type = 2
                 if has_padding:
                     padding_mask = (~valid_token_mask).view(batch, 1, 1, seq_len)
                     merged_mask = merged_mask | padding_mask
             elif has_padding:
-                # Mask type 1 is the compact key-padding-mask representation.
                 merged_mask = ~valid_token_mask
                 mask_type = 1
 
-            x = self._fused_layer_forward(
-                layer,
-                getattr(self, f"_qkv_weight_{layer_index}"),
-                getattr(self, f"_qkv_bias_{layer_index}"),
-                x,
-                merged_mask,
-                mask_type,
-            )
+            x = self.attention(layer_index, x, merged_mask, mask_type)
 
         x = F.layer_norm(
             x,
@@ -344,16 +380,6 @@ class UserOptimizedTransformer(BaselineTransformer):
         if has_padding:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        valid_token_mask = self._normalize_valid_mask(valid_token_mask)
-        
-        return self._forward_impl(x, valid_token_mask)
-
 
 def copy_model_weights(
     baseline: nn.Module, optimized: nn.Module, strict: bool = True
