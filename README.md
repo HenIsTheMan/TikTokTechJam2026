@@ -33,11 +33,13 @@ The build defaults to `/usr/local/cuda` and `TORCH_CUDA_ARCH_LIST=12.0`. Overrid
 either Make variable if needed. Generated binaries and build products are
 ignored by Git.
 
-Select a backend explicitly with `--optimized-backend pytorch` or
-`--optimized-backend cuda`. The CUDA backend is intentionally limited to the
-default CUDA float32 shape. `auto` falls back to the compiled PyTorch path until
-the custom kernels pass strict accuracy and improve end-to-end median latency by
-at least 3% on the RTX 5090.
+Select a backend explicitly with `--optimized-backend pytorch`,
+`--optimized-backend cuda`, or `--optimized-backend cuda-hybrid`. The CUDA
+backends are intentionally limited to the default CUDA float32 shape. The
+validated hybrid uses TF32 tensor cores only for all FFN contraction GEMMs and
+the first three FFN expansion GEMMs; attention and the remaining projections stay
+strict FP32. `auto` selects this hybrid when the extension is available and
+falls back to compiled PyTorch otherwise.
 
 Representative RTX 5090 validation for the default FP32 shape:
 
@@ -45,10 +47,12 @@ Representative RTX 5090 validation for the default FP32 shape:
 | --- | ---: | ---: | --- |
 | Compiled PyTorch | 1.2036 ms | 1.880x | PASS |
 | Custom CUDA | 1.1986 ms | 1.889x | PASS |
+| CUDA hybrid | 0.9323 ms | 2.268x | PASS |
 
-The custom result is approximately 0.4% faster, so it is available explicitly
-but is not promoted by `auto`. With causal attention and 35% padding, the custom
-backend also passed five accuracy trials and reached a 1.958x baseline speedup.
+The strict custom result is approximately 0.4% faster than compiled PyTorch.
+The selective-TF32 hybrid is about 23% faster and cleared the 3% promotion
+gate. It also passed the causal 35%-padding accuracy suite and reached a 2.520x
+baseline speedup. Full-model TF32 remains disabled because it fails that suite.
 
 BF16 and FP16 can be benchmarked with `--dtype bfloat16` and `--dtype float16`.
 For this six-layer reference, fused attention's normal reduced-precision

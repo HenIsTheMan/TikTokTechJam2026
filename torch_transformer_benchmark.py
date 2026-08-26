@@ -28,7 +28,9 @@ import torch.nn.functional as F
 
 # Set only after the CUDA backend beats the compiled PyTorch implementation by
 # at least 3% on the target GPU and passes the complete accuracy matrix.
-AUTO_CUDA_VALIDATED = False
+AUTO_CUDA_VALIDATED = True
+AUTO_CUDA_BACKEND = "cuda-hybrid"
+HYBRID_TF32_FFN_EXPANSION_LAYERS = 3
 _cuda_extension = None
 
 
@@ -330,54 +332,76 @@ class UserOptimizedTransformer(nn.Module):
             mask = valid_token_mask.contiguous()
             attention_mask = mask[:, None, None, :]
 
-        # The first LayerNorm cannot be fused with a preceding block. Each
-        # subsequent norm is produced by the previous residual fusion.
-        normalized = self.layers[0].norm1(x)
-        for index, layer in enumerate(self.layers):
-            attention_delta = layer.attention(
-                normalized,
-                attention_mask,
-                valid_token_mask,
-                self.config.causal,
-                include_output_bias=False,
-            )
-            x, ffn_input = extension.residual_bias_layer_norm(
-                x,
-                attention_delta,
-                layer.attention.out_proj.bias,
-                layer.norm2.weight,
-                layer.norm2.bias,
-                mask,
-                layer.norm2.eps,
-                False,
-            )
+        selective_tf32 = self.backend == "cuda-hybrid"
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if selective_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = False
 
-            hidden = F.linear(ffn_input, layer.ffn_in.weight, bias=None)
-            hidden = extension.bias_gelu(hidden, layer.ffn_in.bias)
-            ffn_delta = F.linear(hidden, layer.ffn_out.weight, bias=None)
+            # The first LayerNorm cannot be fused with a preceding block. Each
+            # subsequent norm is produced by the previous residual fusion.
+            normalized = self.layers[0].norm1(x)
+            for index, layer in enumerate(self.layers):
+                # Attention projections remain strict FP32. Causal attention
+                # was the most error-sensitive part of the stress matrix.
+                if selective_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                attention_delta = layer.attention(
+                    normalized,
+                    attention_mask,
+                    valid_token_mask,
+                    self.config.causal,
+                    include_output_bias=False,
+                )
+                x, ffn_input = extension.residual_bias_layer_norm(
+                    x,
+                    attention_delta,
+                    layer.attention.out_proj.bias,
+                    layer.norm2.weight,
+                    layer.norm2.bias,
+                    mask,
+                    layer.norm2.eps,
+                    False,
+                )
 
-            last_layer = index + 1 == len(self.layers)
-            following_norm = (
-                self.final_norm if last_layer else self.layers[index + 1].norm1
-            )
-            x, normalized = extension.residual_bias_layer_norm(
-                x,
-                ffn_delta,
-                layer.ffn_out.bias,
-                following_norm.weight,
-                following_norm.bias,
-                mask,
-                following_norm.eps,
-                last_layer,
-            )
-        return normalized
+                # FFN matmuls dominate runtime. The first three expansion GEMMs
+                # and all contraction GEMMs use tensor cores; the conservative
+                # boundary keeps accumulated error below the strict threshold.
+                if selective_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = (
+                        index < HYBRID_TF32_FFN_EXPANSION_LAYERS
+                    )
+                hidden = F.linear(ffn_input, layer.ffn_in.weight, bias=None)
+                hidden = extension.bias_gelu(hidden, layer.ffn_in.bias)
+                if selective_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                ffn_delta = F.linear(hidden, layer.ffn_out.weight, bias=None)
+
+                last_layer = index + 1 == len(self.layers)
+                following_norm = (
+                    self.final_norm if last_layer else self.layers[index + 1].norm1
+                )
+                x, normalized = extension.residual_bias_layer_norm(
+                    x,
+                    ffn_delta,
+                    layer.ffn_out.bias,
+                    following_norm.weight,
+                    following_norm.bias,
+                    mask,
+                    following_norm.eps,
+                    last_layer,
+                )
+            return normalized
+        finally:
+            if selective_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.backend == "cuda":
+        if self.backend in ("cuda", "cuda-hybrid"):
             if not x.is_cuda or x.dtype != torch.float32:
                 raise RuntimeError("The custom backend requires CUDA float32 input")
             return self._forward_cuda(x, valid_token_mask)
@@ -480,10 +504,10 @@ def resolve_optimized_backend(
         return requested
 
     supported = custom_cuda_shape_supported(config, device, dtype)
-    if requested == "cuda":
+    if requested in ("cuda", "cuda-hybrid"):
         if not supported:
             raise ValueError(
-                "--optimized-backend cuda requires CUDA float32 and the default "
+                f"--optimized-backend {requested} requires CUDA float32 and the default "
                 "8x128x512, 8-head, 2048-FFN, 6-layer configuration"
             )
         get_cuda_extension(required=True)
@@ -492,7 +516,7 @@ def resolve_optimized_backend(
     # Auto remains conservative: an extension must be present, eligible, and
     # have cleared the documented accuracy/performance gate on the target GPU.
     if supported and AUTO_CUDA_VALIDATED and get_cuda_extension(required=False):
-        return "cuda"
+        return AUTO_CUDA_BACKEND
     return "pytorch"
 
 
@@ -923,7 +947,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-user", action="store_true")
     parser.add_argument(
         "--optimized-backend",
-        choices=("auto", "pytorch", "cuda"),
+        choices=("auto", "pytorch", "cuda", "cuda-hybrid"),
         default="auto",
         help="auto uses only a CUDA backend that has passed the speed gate",
     )
@@ -1008,7 +1032,7 @@ def main() -> int:
     # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
     compile_user = args.compile_user
-    if optimized_backend == "cuda" and compile_user:
+    if optimized_backend in ("cuda", "cuda-hybrid") and compile_user:
         print(
             "[warning] --compile-user is ignored for the custom CUDA backend; "
             "its fused kernels are already CUDA Graph-capture compatible"
