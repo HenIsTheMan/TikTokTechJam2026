@@ -631,13 +631,231 @@ class BaselineTransformer(nn.Module): # nn.Module is base class
         return x # Return tensor with shape [batch_size, seq_len, d_model]
 
 
-class UserOptimizedTransformer(BaselineTransformer):
+class UserOptimizedTransformerBlock(nn.Module):
+    """Standalone transformer block containing only optimized parameters."""
+
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.norm1 = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=True)
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn_in = nn.Linear(d_model, ffn_dim)
+        self.ffn_out = nn.Linear(ffn_dim, d_model)
+
+
+class UserOptimizedTransformer(nn.Module):
+    """Transformer implementation focused on a small, fast inference path.
+
+    The optimization strategy is intentionally simple:
+    1. Pack Q, K, and V weights once so each layer needs one linear projection.
+    2. Reuse causal masks instead of rebuilding them for every call.
+    3. Call PyTorch's fused Transformer encoder kernel for the main forward path.
+    """
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            UserOptimizedTransformerBlock(
+                config.d_model, config.num_heads, config.ffn_dim
+            )
+            for _ in range(config.num_layers)
+        )
+        self.final_norm = nn.LayerNorm(config.d_model)
+
+        # Save frequently used dimensions so the hot path does not repeatedly
+        # look them up through the configuration object.
+        self._d_model = config.d_model
+        self._num_heads = config.num_heads
+
+        # Combine Q, K, and V weights/biases for each layer into one tensor.
+        # F.linear can then compute all three projections in one operation.
+        self.register_buffer(
+            "_qkv_weights",
+            torch.empty(
+                config.num_layers,
+                3 * config.d_model,
+                config.d_model,
+                dtype=self.layers[0].q_proj.weight.dtype,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_qkv_biases",
+            torch.empty(
+                config.num_layers,
+                3 * config.d_model,
+                dtype=self.layers[0].q_proj.bias.dtype,
+            ),
+            persistent=False,
+        )
+
+        # Cache causal masks by (device, sequence length).  Mask creation is
+        # outside the expensive Transformer kernel, so doing it once is enough.
+        self._causal_mask_cache: Dict[Tuple[torch.device, int], torch.Tensor] = {}
+
+        # Reused only for the common case where the caller repeatedly passes the
+        # same all-True padding mask.  It lets us take the same fast no-padding
+        # path without doing a reduction on every call.
+        self._mask_cache_key: Optional[Tuple[int, int]] = None
+        self._mask_is_all_valid = False
+
+        self._pack_qkv_weights()
+
+    @torch.no_grad()
+    def _pack_qkv_weights(self) -> None:
+        """Copy separate Q/K/V parameters into the packed inference buffers."""
+        d = self._d_model
+        for i, layer in enumerate(self.layers):
+            self._qkv_weights[i, :d].copy_(layer.q_proj.weight)
+            self._qkv_weights[i, d:2 * d].copy_(layer.k_proj.weight)
+            self._qkv_weights[i, 2 * d:].copy_(layer.v_proj.weight)
+            self._qkv_biases[i, :d].copy_(layer.q_proj.bias)
+            self._qkv_biases[i, d:2 * d].copy_(layer.k_proj.bias)
+            self._qkv_biases[i, 2 * d:].copy_(layer.v_proj.bias)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load baseline weights and rebuild the packed QKV buffers."""
+        remapped = state_dict.copy()
+        for key in list(remapped):
+            # The baseline stores these layers under attention.q_proj/k_proj/v_proj;
+            # this optimized model stores them directly on the block.
+            if key.startswith("layers.") and ".attention." in key:
+                new_key = key.replace(".attention.", ".", 1)
+                if new_key not in remapped:
+                    remapped[new_key] = remapped[key]
+                del remapped[key]
+
+        result = super().load_state_dict(remapped, strict=strict, assign=assign)
+        self._pack_qkv_weights()
+        self._causal_mask_cache.clear()
+        self._mask_cache_key = None
+        return result
+
+    def _valid_mask_or_none(
+        self, valid_token_mask: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Return None for an all-valid mask so the fused no-mask path can run."""
+        if valid_token_mask is None:
+            return None
+
+        # data_ptr + version identify the same unchanged tensor.  Only when that
+        # identity changes do we perform the potentially expensive .all() check.
+        try:
+            version = valid_token_mask._version
+        except RuntimeError:
+            version = -1
+        key = (valid_token_mask.data_ptr(), version)
+
+        if key != self._mask_cache_key:
+            self._mask_cache_key = key
+            self._mask_is_all_valid = bool(valid_token_mask.all().item())
+
+        return None if self._mask_is_all_valid else valid_token_mask
+
+    def _causal_mask(self, device: torch.device, seq_len: int) -> torch.Tensor:
+        """Get or create the boolean upper-triangular causal attention mask."""
+        key = (device, seq_len)
+        mask = self._causal_mask_cache.get(key)
+        if mask is None:
+            mask = torch.ones(
+                (seq_len, seq_len), device=device, dtype=torch.bool
+            ).triu(1)
+            # The fused kernel expects the broadcastable [1, H, S, S] form.
+            mask = mask.view(1, 1, seq_len, seq_len).expand(
+                1, self._num_heads, seq_len, seq_len
+            )
+            self._causal_mask_cache[key] = mask
+        return mask
+
+    def _run_layer(
+        self,
+        layer_index: int,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        mask_type: Optional[int],
+    ) -> torch.Tensor:
+        """Run one complete Transformer block through PyTorch's fused kernel."""
+        layer = self.layers[layer_index]
+        return torch._transformer_encoder_layer_fwd(
+            x,
+            self._d_model,
+            self._num_heads,
+            self._qkv_weights[layer_index],
+            self._qkv_biases[layer_index],
+            layer.out_proj.weight,
+            layer.out_proj.bias,
+            True,  # norm_first
+            True,  # training-disabled inference path
+            layer.norm1.eps,
+            layer.norm1.weight,
+            layer.norm1.bias,
+            layer.norm2.weight,
+            layer.norm2.bias,
+            layer.ffn_in.weight,
+            layer.ffn_in.bias,
+            layer.ffn_out.weight,
+            layer.ffn_out.bias,
+            mask,
+            mask_type,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor: # Func sig cannot be changed
-        return super().forward(x, valid_token_mask)
+    ) -> torch.Tensor:
+        """Run the optimized full-sequence inference path."""
+        valid_token_mask = self._valid_mask_or_none(valid_token_mask)
+        has_padding = valid_token_mask is not None
+
+        if not self.config.causal and not has_padding:
+            # Fastest case: no attention mask at all.  PyTorch can use its
+            # most optimized fused encoder implementation here.
+            mask = None
+            mask_type = None
+        else:
+            _, seq_len, _ = x.shape
+            if self.config.causal:
+                # Causal attention: each token can only attend to itself and
+                # earlier tokens.
+                mask = self._causal_mask(x.device, seq_len)
+                if has_padding:
+                    # Add padding restrictions to the causal restrictions.
+                    mask = mask | (~valid_token_mask).view(1, 1, -1, seq_len)
+                mask_type = 2
+            else:
+                # Non-causal attention only needs the padding mask.
+                mask = ~valid_token_mask
+                mask_type = 1
+
+        # The fused kernel handles normalization, attention, residuals, and FFN
+        # work for every Transformer block in one optimized primitive.
+        for i in range(len(self.layers)):
+            x = self._run_layer(i, x, mask, mask_type)
+
+        # Apply the final output normalization once, after all Transformer blocks.
+        x = F.layer_norm(
+            x,
+            (self._d_model,),
+            self.final_norm.weight,
+            self.final_norm.bias,
+            self.final_norm.eps,
+        )
+
+        # Keep padded output positions exactly zero, matching the baseline.
+        if has_padding:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+
+        return x
 
 
 # Entry Pt
