@@ -210,8 +210,6 @@ on an OpenAI API or network connection when it runs.
 - **Python standard library:** `argparse`, `copy`, `dataclasses`, `math`,
   `statistics`, and `time` support configuration, validation, and reporting.
 - **setuptools:** Builds the ahead-of-time CUDA extension.
-- **python-pptx:** Generates the accompanying project presentation; it is not a
-  dependency of the Transformer benchmark itself.
 
 Hugging Face Transformers, TensorFlow, scikit-learn, pandas, and NumPy are not
 used by the benchmark implementation.
