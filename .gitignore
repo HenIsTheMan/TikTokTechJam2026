@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+build/
+transformer_cuda_ext.cpython-312-x86_64-linux-gnu.so
+*.pptx

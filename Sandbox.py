@@ -14,6 +14,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# Optional custom CUDA backend, adapted from cuda.py.
+AUTO_CUDA_VALIDATED = True
+AUTO_CUDA_BACKEND = "cuda-hybrid"
+HYBRID_TF32_FFN_EXPANSION_LAYERS = 3
+_cuda_extension = None
+
+
+def get_cuda_extension(required: bool = True):
+    """Load the pre-built CUDA extension without compiling it at runtime."""
+    global _cuda_extension
+    if _cuda_extension is not None:
+        return _cuda_extension
+    try:
+        import transformer_cuda_ext
+    except ImportError as error:
+        if required:
+            raise RuntimeError(
+                "The CUDA backend is not built. Run `make build-cuda` first."
+            ) from error
+        return None
+    _cuda_extension = transformer_cuda_ext
+    return _cuda_extension
+
+
 # Parse Cmd-Line Args
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -50,6 +74,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--compile-baseline", action="store_true")
     parser.add_argument("--compile-user", action="store_true")
+    parser.add_argument(
+        "--optimized-backend",
+        choices=("auto", "pytorch", "cuda", "cuda-hybrid"),
+        default="auto",
+        help="auto uses the custom CUDA backend only when its shape/build gate passes",
+    )
     parser.add_argument(
         "--compile-mode",
         choices=("default", "reduce-overhead", "max-autotune"),
@@ -652,17 +682,20 @@ class UserOptimizedTransformerBlock(nn.Module):
 
 
 class UserOptimizedTransformer(nn.Module):
-    """Transformer implementation focused on a small, fast inference path.
+    """Sandbox optimized Transformer with optional custom CUDA dispatch.
 
-    The optimization strategy is intentionally simple:
-    1. Pack Q, K, and V weights once so each layer needs one linear projection.
-    2. Reuse causal masks instead of rebuilding them for every call.
-    3. Call PyTorch's fused Transformer encoder kernel for the main forward path.
+    backend="pytorch" always uses Sandbox's existing fused PyTorch forward.
+    backend="cuda" or "cuda-hybrid" uses the custom CUDA path from cuda.py.
+    backend="auto" selects the CUDA path only when its supported shape/backend
+    is available; otherwise it uses Sandbox's existing PyTorch path.
     """
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(self, config: TransformerConfig, backend: str = "auto") -> None:
         super().__init__()
+        if backend not in ("auto", "pytorch", "cuda", "cuda-hybrid"):
+            raise ValueError(f"unknown backend: {backend}")
         self.config = config
+        self.backend = backend
         self.layers = nn.ModuleList(
             UserOptimizedTransformerBlock(
                 config.d_model, config.num_heads, config.ffn_dim
@@ -671,13 +704,9 @@ class UserOptimizedTransformer(nn.Module):
         )
         self.final_norm = nn.LayerNorm(config.d_model)
 
-        # Save frequently used dimensions so the hot path does not repeatedly
-        # look them up through the configuration object.
         self._d_model = config.d_model
         self._num_heads = config.num_heads
 
-        # Combine Q, K, and V weights/biases for each layer into one tensor.
-        # F.linear can then compute all three projections in one operation.
         self.register_buffer(
             "_qkv_weights",
             torch.empty(
@@ -698,21 +727,19 @@ class UserOptimizedTransformer(nn.Module):
             persistent=False,
         )
 
-        # Cache causal masks by (device, sequence length).  Mask creation is
-        # outside the expensive Transformer kernel, so doing it once is enough.
         self._causal_mask_cache: Dict[Tuple[torch.device, int], torch.Tensor] = {}
-
-        # Reused only for the common case where the caller repeatedly passes the
-        # same all-True padding mask.  It lets us take the same fast no-padding
-        # path without doing a reduction on every call.
         self._mask_cache_key: Optional[Tuple[int, int]] = None
         self._mask_is_all_valid = False
+
+        self.register_buffer(
+            "_empty_mask", torch.empty(0, dtype=torch.bool), persistent=False
+        )
 
         self._pack_qkv_weights()
 
     @torch.no_grad()
     def _pack_qkv_weights(self) -> None:
-        """Copy separate Q/K/V parameters into the packed inference buffers."""
+        """Pack Sandbox's separate Q/K/V parameters for its fused PyTorch path."""
         d = self._d_model
         for i, layer in enumerate(self.layers):
             self._qkv_weights[i, :d].copy_(layer.q_proj.weight)
@@ -723,11 +750,9 @@ class UserOptimizedTransformer(nn.Module):
             self._qkv_biases[i, 2 * d:].copy_(layer.v_proj.bias)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Load baseline weights and rebuild the packed QKV buffers."""
+        """Load baseline weights and rebuild packed QKV buffers."""
         remapped = state_dict.copy()
         for key in list(remapped):
-            # The baseline stores these layers under attention.q_proj/k_proj/v_proj;
-            # this optimized model stores them directly on the block.
             if key.startswith("layers.") and ".attention." in key:
                 new_key = key.replace(".attention.", ".", 1)
                 if new_key not in remapped:
@@ -743,33 +768,25 @@ class UserOptimizedTransformer(nn.Module):
     def _valid_mask_or_none(
         self, valid_token_mask: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
-        """Return None for an all-valid mask so the fused no-mask path can run."""
         if valid_token_mask is None:
             return None
-
-        # data_ptr + version identify the same unchanged tensor.  Only when that
-        # identity changes do we perform the potentially expensive .all() check.
         try:
             version = valid_token_mask._version
         except RuntimeError:
             version = -1
         key = (valid_token_mask.data_ptr(), version)
-
         if key != self._mask_cache_key:
             self._mask_cache_key = key
             self._mask_is_all_valid = bool(valid_token_mask.all().item())
-
         return None if self._mask_is_all_valid else valid_token_mask
 
     def _causal_mask(self, device: torch.device, seq_len: int) -> torch.Tensor:
-        """Get or create the boolean upper-triangular causal attention mask."""
         key = (device, seq_len)
         mask = self._causal_mask_cache.get(key)
         if mask is None:
             mask = torch.ones(
                 (seq_len, seq_len), device=device, dtype=torch.bool
             ).triu(1)
-            # The fused kernel expects the broadcastable [1, H, S, S] form.
             mask = mask.view(1, 1, seq_len, seq_len).expand(
                 1, self._num_heads, seq_len, seq_len
             )
@@ -783,7 +800,7 @@ class UserOptimizedTransformer(nn.Module):
         mask: Optional[torch.Tensor],
         mask_type: Optional[int],
     ) -> torch.Tensor:
-        """Run one complete Transformer block through PyTorch's fused kernel."""
+        """Sandbox's existing fused PyTorch Transformer encoder primitive."""
         layer = self.layers[layer_index]
         return torch._transformer_encoder_layer_fwd(
             x,
@@ -793,8 +810,8 @@ class UserOptimizedTransformer(nn.Module):
             self._qkv_biases[layer_index],
             layer.out_proj.weight,
             layer.out_proj.bias,
-            True,  # norm_first
-            True,  # training-disabled inference path
+            True,
+            True,
             layer.norm1.eps,
             layer.norm1.weight,
             layer.norm1.bias,
@@ -808,41 +825,32 @@ class UserOptimizedTransformer(nn.Module):
             mask_type,
         )
 
-    def forward(
+    def _forward_pytorch(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run the optimized full-sequence inference path."""
+        """Original Sandbox forward implementation."""
         valid_token_mask = self._valid_mask_or_none(valid_token_mask)
         has_padding = valid_token_mask is not None
 
         if not self.config.causal and not has_padding:
-            # Fastest case: no attention mask at all.  PyTorch can use its
-            # most optimized fused encoder implementation here.
             mask = None
             mask_type = None
         else:
             _, seq_len, _ = x.shape
             if self.config.causal:
-                # Causal attention: each token can only attend to itself and
-                # earlier tokens.
                 mask = self._causal_mask(x.device, seq_len)
                 if has_padding:
-                    # Add padding restrictions to the causal restrictions.
                     mask = mask | (~valid_token_mask).view(1, 1, -1, seq_len)
                 mask_type = 2
             else:
-                # Non-causal attention only needs the padding mask.
                 mask = ~valid_token_mask
                 mask_type = 1
 
-        # The fused kernel handles normalization, attention, residuals, and FFN
-        # work for every Transformer block in one optimized primitive.
         for i in range(len(self.layers)):
             x = self._run_layer(i, x, mask, mask_type)
 
-        # Apply the final output normalization once, after all Transformer blocks.
         x = F.layer_norm(
             x,
             (self._d_model,),
@@ -850,12 +858,181 @@ class UserOptimizedTransformer(nn.Module):
             self.final_norm.bias,
             self.final_norm.eps,
         )
-
-        # Keep padded output positions exactly zero, matching the baseline.
         if has_padding:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
-
         return x
+
+    def _forward_cuda(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """CUDA inference implementation adapted from cuda.py."""
+        if torch.is_grad_enabled():
+            raise RuntimeError("The custom CUDA backend supports inference only")
+        if not x.is_cuda or x.dtype != torch.float32:
+            raise RuntimeError("The custom CUDA backend requires CUDA float32 input")
+
+        extension = get_cuda_extension(required=True)
+        mask = self._empty_mask
+        attention_mask: Optional[torch.Tensor] = None
+        if valid_token_mask is not None:
+            mask = valid_token_mask.contiguous()
+            attention_mask = mask[:, None, None, :]
+
+        selective_tf32 = self.backend == "cuda-hybrid"
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if selective_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = False
+
+            normalized = self.layers[0].norm1(x)
+            for index, layer in enumerate(self.layers):
+                if selective_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = False
+
+                batch, seq_len, _ = normalized.shape
+                head_dim = self._d_model // self._num_heads
+                qkv = F.linear(
+                    normalized,
+                    self._qkv_weights[index],
+                    self._qkv_biases[index],
+                ).view(batch, seq_len, 3, self._num_heads, head_dim)
+                q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+
+                # Match cuda.py's attention computation. When padding is present
+                # together with causal attention, combine both restrictions into
+                # one explicit boolean mask because SDPA does not accept both a
+                # non-None attn_mask and is_causal=True simultaneously.
+                if self.config.causal and attention_mask is not None:
+                    causal = torch.ones(
+                        (seq_len, seq_len), device=x.device, dtype=torch.bool
+                    ).triu(1)
+                    allowed = (~causal)[None, None, :, :] & attention_mask
+                    context = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=allowed, dropout_p=0.0, is_causal=False
+                    )
+                else:
+                    context = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=attention_mask,
+                        dropout_p=0.0,
+                        is_causal=self.config.causal,
+                    )
+                context = context.transpose(1, 2).reshape(
+                    batch, seq_len, self._d_model
+                )
+                attention_delta = F.linear(
+                    context, layer.out_proj.weight, bias=None
+                )
+
+                x, ffn_input = extension.residual_bias_layer_norm(
+                    x,
+                    attention_delta,
+                    layer.out_proj.bias,
+                    layer.norm2.weight,
+                    layer.norm2.bias,
+                    mask,
+                    layer.norm2.eps,
+                    False,
+                )
+
+                if selective_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = (
+                        index < HYBRID_TF32_FFN_EXPANSION_LAYERS
+                    )
+                hidden = F.linear(ffn_input, layer.ffn_in.weight, bias=None)
+                hidden = extension.bias_gelu(hidden, layer.ffn_in.bias)
+                if selective_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                ffn_delta = F.linear(hidden, layer.ffn_out.weight, bias=None)
+
+                last_layer = index + 1 == len(self.layers)
+                following_norm = (
+                    self.final_norm if last_layer else self.layers[index + 1].norm1
+                )
+                x, normalized = extension.residual_bias_layer_norm(
+                    x,
+                    ffn_delta,
+                    layer.ffn_out.bias,
+                    following_norm.weight,
+                    following_norm.bias,
+                    mask,
+                    following_norm.eps,
+                    last_layer,
+                )
+
+            return normalized
+        finally:
+            if selective_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Explicit backend selection takes precedence. Auto uses CUDA only when
+        # the CUDA implementation is actually eligible and the extension exists.
+        if self.backend == "pytorch":
+            return self._forward_pytorch(x, valid_token_mask)
+        if self.backend in ("cuda", "cuda-hybrid"):
+            return self._forward_cuda(x, valid_token_mask)
+
+        # backend == "auto"
+        if x.is_cuda and x.dtype == torch.float32:
+            supported = custom_cuda_shape_supported(self.config, x.device, x.dtype)
+            if supported and AUTO_CUDA_VALIDATED and get_cuda_extension(required=False):
+                original_backend = self.backend
+                self.backend = AUTO_CUDA_BACKEND
+                try:
+                    return self._forward_cuda(x, valid_token_mask)
+                finally:
+                    self.backend = original_backend
+
+        return self._forward_pytorch(x, valid_token_mask)
+
+
+def custom_cuda_shape_supported(
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> bool:
+    """Shape/device gate copied from cuda.py for the custom kernels."""
+    return (
+        device.type == "cuda"
+        and dtype == torch.float32
+        and config.batch_size == 8
+        and config.seq_len == 128
+        and config.d_model == 512
+        and config.num_heads == 8
+        and config.ffn_dim == 2048
+        and config.num_layers == 6
+    )
+
+
+def resolve_optimized_backend(
+    requested: str,
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> str:
+    if requested == "pytorch":
+        return requested
+
+    supported = custom_cuda_shape_supported(config, device, dtype)
+    if requested in ("cuda", "cuda-hybrid"):
+        if not supported:
+            raise ValueError(
+                f"--optimized-backend {requested} requires CUDA float32 and the default "
+                "8x128x512, 8-head, 2048-FFN, 6-layer configuration"
+            )
+        get_cuda_extension(required=True)
+        return requested
+
+    if supported and AUTO_CUDA_VALIDATED and get_cuda_extension(required=False):
+        return AUTO_CUDA_BACKEND
+    return "pytorch"
 
 
 # Entry Pt
@@ -893,6 +1070,10 @@ def main() -> int:
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
     # End: PyTorch setup
 
+    optimized_backend = resolve_optimized_backend(
+        args.optimized_backend, config, device, dtype
+    )
+
     # Start: Logging of setup info
     print("=== Configuration ===")
     
@@ -900,13 +1081,15 @@ def main() -> int:
     
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
     
+    print(f"optimized_backend={optimized_backend} (requested={args.optimized_backend})")
+
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
     # End: Logging of setup info
 
     baseline = BaselineTransformer(config)
     
-    optimized = UserOptimizedTransformer(config)
+    optimized = UserOptimizedTransformer(config, backend=optimized_backend)
     
     copy_model_weights(
         baseline,
@@ -920,7 +1103,14 @@ def main() -> int:
 
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
     
-    optimized = maybe_compile(optimized, args.compile_user, args.compile_mode)
+    compile_user = args.compile_user
+    if optimized_backend in ("cuda", "cuda-hybrid") and compile_user:
+        print(
+            "[warning] --compile-user is ignored for the custom CUDA backend; "
+            "its CUDA path is already specialized for inference"
+        )
+        compile_user = False
+    optimized = maybe_compile(optimized, compile_user, args.compile_mode)
 
     accuracy_passed = run_accuracy_tests(
         baseline=baseline,
