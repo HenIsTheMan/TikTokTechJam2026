@@ -675,6 +675,78 @@ class UserOptimizedTransformerBlock(nn.Module):
         self.ffn_out = nn.Linear(ffn_dim, d_model)
 
 
+class OptimizedSelfAttention(nn.Module):
+    """Self-attention module used by the custom CUDA pipeline."""
+
+    def __init__(self, d_model: int, num_heads: int) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+        include_output_bias: bool = True,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        qkv = self.qkv_proj(x).view(
+            batch, seq_len, 3, self.num_heads, self.head_dim
+        )
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        context = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=causal,
+        )
+        context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
+        output = F.linear(
+            context,
+            self.out_proj.weight,
+            self.out_proj.bias if include_output_bias else None,
+        )
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
+
+class OptimizedTransformerBlock(nn.Module):
+    """Transformer block used by the custom CUDA pipeline."""
+
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attention = OptimizedSelfAttention(d_model, num_heads)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn_in = nn.Linear(d_model, ffn_dim)
+        self.ffn_out = nn.Linear(ffn_dim, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+    ) -> torch.Tensor:
+        x = x + self.attention(
+            self.norm1(x), attention_mask, valid_token_mask, causal
+        )
+        x = x + self.ffn_out(
+            F.gelu(self.ffn_in(self.norm2(x)), approximate="none")
+        )
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
+
+
 class UserOptimizedTransformer(nn.Module):
     """Transformer with automatic PyTorch/CUDA inference dispatch.
 
@@ -687,6 +759,14 @@ class UserOptimizedTransformer(nn.Module):
         self.config = config
         self.layers = nn.ModuleList(
             UserOptimizedTransformerBlock(
+                config.d_model, config.num_heads, config.ffn_dim
+            )
+            for _ in range(config.num_layers)
+        )
+        # Separate parameter tree for the cuda.py attention/block pipeline.
+        # The PyTorch path above retains Sandbox's packed-QKV representation.
+        self.cuda_layers = nn.ModuleList(
+            OptimizedTransformerBlock(
                 config.d_model, config.num_heads, config.ffn_dim
             )
             for _ in range(config.num_layers)
@@ -747,6 +827,28 @@ class UserOptimizedTransformer(nn.Module):
                 if new_key not in remapped:
                     remapped[new_key] = remapped[key]
                 del remapped[key]
+
+        # copy_model_weights() intentionally remains unchanged and only supplies
+        # the original Sandbox parameter tree. Populate the CUDA-only tree from
+        # those already-loaded optimized parameters so strict loading still works.
+        for index, layer in enumerate(self.cuda_layers):
+            source = self.layers[index]
+            remapped[f"cuda_layers.{index}.norm1.weight"] = source.norm1.weight
+            remapped[f"cuda_layers.{index}.norm1.bias"] = source.norm1.bias
+            remapped[f"cuda_layers.{index}.attention.qkv_proj.weight"] = torch.cat(
+                (source.q_proj.weight, source.k_proj.weight, source.v_proj.weight), dim=0
+            )
+            remapped[f"cuda_layers.{index}.attention.qkv_proj.bias"] = torch.cat(
+                (source.q_proj.bias, source.k_proj.bias, source.v_proj.bias), dim=0
+            )
+            remapped[f"cuda_layers.{index}.attention.out_proj.weight"] = source.out_proj.weight
+            remapped[f"cuda_layers.{index}.attention.out_proj.bias"] = source.out_proj.bias
+            remapped[f"cuda_layers.{index}.norm2.weight"] = source.norm2.weight
+            remapped[f"cuda_layers.{index}.norm2.bias"] = source.norm2.bias
+            remapped[f"cuda_layers.{index}.ffn_in.weight"] = source.ffn_in.weight
+            remapped[f"cuda_layers.{index}.ffn_in.bias"] = source.ffn_in.bias
+            remapped[f"cuda_layers.{index}.ffn_out.weight"] = source.ffn_out.weight
+            remapped[f"cuda_layers.{index}.ffn_out.bias"] = source.ffn_out.bias
 
         result = super().load_state_dict(remapped, strict=strict, assign=assign)
         self._pack_qkv_weights()
@@ -876,45 +978,35 @@ class UserOptimizedTransformer(nn.Module):
             if selective_tf32:
                 torch.backends.cuda.matmul.allow_tf32 = False
 
-            normalized = self.layers[0].norm1(x)
-            for index, layer in enumerate(self.layers):
+            normalized = self.cuda_layers[0].norm1(x)
+            for index, layer in enumerate(self.cuda_layers):
                 if selective_tf32:
                     torch.backends.cuda.matmul.allow_tf32 = False
 
-                batch, seq_len, _ = normalized.shape
-                head_dim = self._d_model // self._num_heads
-                qkv = F.linear(
-                    normalized,
-                    self._qkv_weights[index],
-                    self._qkv_biases[index],
-                ).view(batch, seq_len, 3, self._num_heads, head_dim)
-                q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+                _, seq_len, _ = normalized.shape
 
-                # Match cuda.py's attention computation. When padding is present
-                # together with causal attention, combine both restrictions into
-                # one explicit boolean mask because SDPA does not accept both a
-                # non-None attn_mask and is_causal=True simultaneously.
+                # The restored OptimizedSelfAttention owns the QKV projection
+                # and SDPA operation for the CUDA pipeline.
                 if self.config.causal and attention_mask is not None:
-                    causal = torch.ones(
+                    causal_mask = torch.ones(
                         (seq_len, seq_len), device=x.device, dtype=torch.bool
                     ).triu(1)
-                    allowed = (~causal)[None, None, :, :] & attention_mask
-                    context = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=allowed, dropout_p=0.0, is_causal=False
+                    combined_mask = (~causal_mask)[None, None, :, :] & attention_mask
+                    attention_delta = layer.attention(
+                        normalized,
+                        combined_mask,
+                        valid_token_mask,
+                        False,
+                        include_output_bias=False,
                     )
                 else:
-                    context = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=attention_mask,
-                        dropout_p=0.0,
-                        is_causal=self.config.causal,
+                    attention_delta = layer.attention(
+                        normalized,
+                        attention_mask,
+                        valid_token_mask,
+                        self.config.causal,
+                        include_output_bias=False,
                     )
-                context = context.transpose(1, 2).reshape(
-                    batch, seq_len, self._d_model
-                )
-                attention_delta = F.linear(
-                    context, layer.out_proj.weight, bias=None
-                )
 
                 x, ffn_input = extension.residual_bias_layer_norm(
                     x,
@@ -937,9 +1029,9 @@ class UserOptimizedTransformer(nn.Module):
                     torch.backends.cuda.matmul.allow_tf32 = True
                 ffn_delta = F.linear(hidden, layer.ffn_out.weight, bias=None)
 
-                last_layer = index + 1 == len(self.layers)
+                last_layer = index + 1 == len(self.cuda_layers)
                 following_norm = (
-                    self.final_norm if last_layer else self.layers[index + 1].norm1
+                    self.final_norm if last_layer else self.cuda_layers[index + 1].norm1
                 )
                 x, normalized = extension.residual_bias_layer_norm(
                     x,
