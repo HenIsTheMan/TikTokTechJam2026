@@ -1,28 +1,22 @@
-PYTHON ?= .venv/bin/python
 CUDA_HOME ?= /usr/local/cuda
 TORCH_CUDA_ARCH_LIST ?= 12.0
-BENCHMARK_ARGS ?=
+CMD_LINE_ARGS ?=
 
-.PHONY: build-cuda benchmark benchmark-cuda benchmark-hybrid benchmark-all
+.DEFAULT_GOAL := cpu
+
+.PHONY: cuda cpu build-cuda clean
+
+cuda: build-cuda
+	python3 Sandbox.py --device cuda $(CMD_LINE_ARGS)
+
+cpu:
+	python3 Sandbox.py --device cpu $(CMD_LINE_ARGS)
 
 build-cuda:
 	CUDA_HOME="$(CUDA_HOME)" TORCH_CUDA_ARCH_LIST="$(TORCH_CUDA_ARCH_LIST)" \
-		"$(PYTHON)" setup_cuda.py build_ext --inplace
+		python3 setup_cuda.py build_ext --inplace
 
-benchmark:
-	"$(PYTHON)" Sandbox.py --device cuda --dtype float32 \
-		--optimized-backend pytorch --compile-user \
-		--compile-mode reduce-overhead $(BENCHMARK_ARGS)
-
-benchmark-cuda: build-cuda
-	"$(PYTHON)" Sandbox.py --device cuda --dtype float32 \
-		--optimized-backend cuda $(BENCHMARK_ARGS)
-
-benchmark-hybrid: build-cuda
-	"$(PYTHON)" Sandbox.py --device cuda --dtype float32 \
-		--optimized-backend cuda-hybrid $(BENCHMARK_ARGS)
-
-benchmark-all: build-cuda benchmark benchmark-cuda benchmark-hybrid
-
-benchmark-best:
-	make benchmark-hybrid BENCHMARK_ARGS="--causal --padding-ratio 0.35"
+clean:
+	rm -rf build
+	rm -f transformer_cuda_ext*.so
+	rm -rf ./*.egg-info
