@@ -10,16 +10,16 @@ build-cuda:
 		"$(PYTHON)" setup_cuda.py build_ext --inplace
 
 benchmark:
-	"$(PYTHON)" torch_transformer_benchmark.py --device cuda --dtype float32 \
+	"$(PYTHON)" Sandbox.py --device cuda --dtype float32 \
 		--optimized-backend pytorch --compile-user \
 		--compile-mode reduce-overhead $(BENCHMARK_ARGS)
 
 benchmark-cuda: build-cuda
-	"$(PYTHON)" torch_transformer_benchmark.py --device cuda --dtype float32 \
+	"$(PYTHON)" Sandbox.py --device cuda --dtype float32 \
 		--optimized-backend cuda $(BENCHMARK_ARGS)
 
 benchmark-hybrid: build-cuda
-	"$(PYTHON)" torch_transformer_benchmark.py --device cuda --dtype float32 \
+	"$(PYTHON)" Sandbox.py --device cuda --dtype float32 \
 		--optimized-backend cuda-hybrid $(BENCHMARK_ARGS)
 
 benchmark-all: build-cuda benchmark benchmark-cuda benchmark-hybrid
