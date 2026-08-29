@@ -24,6 +24,7 @@ setup(
                 str(ROOT / "cuda_extension" / "binding.cpp"),
                 str(ROOT / "cuda_extension" / "kernels.cu"),
             ],
+            libraries=["cublasLt"],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-lineinfo"],

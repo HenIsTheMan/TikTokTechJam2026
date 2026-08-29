@@ -15,23 +15,100 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 # Set only after the CUDA backend beats the compiled PyTorch implementation by
 # at least 3% on the target GPU and passes the complete accuracy matrix.
 AUTO_CUDA_VALIDATED = True
 AUTO_CUDA_BACKEND = "cuda-hybrid"
-HYBRID_TF32_FFN_EXPANSION_LAYERS = 3
+AGGRESSIVE_CUDA_VALIDATED = False
+AGGRESSIVE_LT_FFN_VALIDATED = False
 _cuda_extension = None
+
+
+@dataclass(frozen=True)
+class GemmPrecisionPlan:
+    """Per-layer TF32 policy for the four explicit GEMMs in each block."""
+
+    qkv: Tuple[bool, ...]
+    attention_out: Tuple[bool, ...]
+    ffn_in: Tuple[bool, ...]
+    ffn_out: Tuple[bool, ...]
+
+    def validate(self, layers: int) -> None:
+        for name, values in (
+            ("qkv", self.qkv),
+            ("attention_out", self.attention_out),
+            ("ffn_in", self.ffn_in),
+            ("ffn_out", self.ffn_out),
+        ):
+            if len(values) != layers:
+                raise ValueError(f"precision plan {name} must contain {layers} values")
+
+    def to_mask(self) -> int:
+        mask = 0
+        offset = 0
+        for values in (self.qkv, self.attention_out, self.ffn_in, self.ffn_out):
+            for enabled in values:
+                if enabled:
+                    mask |= 1 << offset
+                offset += 1
+        return mask
+
+    @classmethod
+    def from_mask(cls, mask: int, layers: int) -> "GemmPrecisionPlan":
+        if mask < 0 or mask >= (1 << (4 * layers)):
+            raise ValueError(f"precision mask must fit in {4 * layers} bits")
+        groups = []
+        offset = 0
+        for _ in range(4):
+            groups.append(tuple(bool(mask & (1 << (offset + i))) for i in range(layers)))
+            offset += layers
+        return cls(*groups)
+
+    @classmethod
+    def strict(cls, layers: int) -> "GemmPrecisionPlan":
+        disabled = (False,) * layers
+        return cls(disabled, disabled, disabled, disabled)
+
+    @classmethod
+    def validated_hybrid(cls, layers: int) -> "GemmPrecisionPlan":
+        # This reproduces the previously validated policy: strict attention,
+        # TF32 for the first three FFN expansions, and every FFN contraction.
+        disabled = (False,) * layers
+        return cls(
+            disabled,
+            disabled,
+            tuple(index < 3 for index in range(layers)),
+            (True,) * layers,
+        )
+
+    def describe(self) -> str:
+        def enabled(values: Tuple[bool, ...]) -> str:
+            indices = [str(i) for i, value in enumerate(values) if value]
+            return ",".join(indices) if indices else "none"
+
+        return (
+            f"mask=0x{self.to_mask():x} qkv=[{enabled(self.qkv)}] "
+            f"attention_out=[{enabled(self.attention_out)}] "
+            f"ffn_in=[{enabled(self.ffn_in)}] ffn_out=[{enabled(self.ffn_out)}]"
+        )
+
+
+# Updated only after `make tune-aggressive` passes the complete target-GPU gate.
+VALIDATED_AGGRESSIVE_TF32_MASK = GemmPrecisionPlan.validated_hybrid(6).to_mask()
 
 
 def get_cuda_extension(required: bool = True):
@@ -200,7 +277,9 @@ class BaselineTransformer(nn.Module):
 class OptimizedSelfAttention(nn.Module):
     """Self-attention using one QKV projection and PyTorch's fused SDPA."""
 
-    def __init__(self, d_model: int, num_heads: int) -> None:
+    def __init__(
+        self, d_model: int, num_heads: int, force_flash: bool = False
+    ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
@@ -208,6 +287,7 @@ class OptimizedSelfAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.force_flash = force_flash
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=True)
         self.out_proj = nn.Linear(d_model, d_model, bias=True)
 
@@ -218,25 +298,46 @@ class OptimizedSelfAttention(nn.Module):
         valid_token_mask: Optional[torch.Tensor],
         causal: bool,
         include_output_bias: bool = True,
+        qkv_tf32: Optional[bool] = None,
+        output_tf32: Optional[bool] = None,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
+        if qkv_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = qkv_tf32
         # [B, S, 3D] -> three [B, H, S, Dh] views. Keeping the head dimension
         # before sequence is the layout expected by scaled_dot_product_attention.
         qkv = self.qkv_proj(x).view(
             batch, seq_len, 3, self.num_heads, self.head_dim
         )
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        if qkv_tf32 is not None:
+            # Keep the attention score/value kernels conservative; the qkv bit
+            # controls only the projection GEMM and is independently searchable.
+            torch.backends.cuda.matmul.allow_tf32 = False
 
-        context = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=causal,
-        )
+        if self.force_flash:
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                context = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=causal,
+                )
+        else:
+            context = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=causal,
+            )
         context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
+        if output_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = output_tf32
         output = F.linear(
             context,
             self.out_proj.weight,
@@ -249,10 +350,12 @@ class OptimizedSelfAttention(nn.Module):
 
 
 class OptimizedTransformerBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
+    def __init__(
+        self, d_model: int, num_heads: int, ffn_dim: int, force_flash: bool = False
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attention = OptimizedSelfAttention(d_model, num_heads)
+        self.attention = OptimizedSelfAttention(d_model, num_heads, force_flash)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn_in = nn.Linear(d_model, ffn_dim)
         self.ffn_out = nn.Linear(ffn_dim, d_model)
@@ -277,14 +380,40 @@ class OptimizedTransformerBlock(nn.Module):
 class UserOptimizedTransformer(nn.Module):
     """Transformer with fused QKV/SDPA and an optional custom CUDA backend."""
 
-    def __init__(self, config: TransformerConfig, backend: str = "pytorch") -> None:
+    def __init__(
+        self,
+        config: TransformerConfig,
+        backend: str = "pytorch",
+        precision_plan: Optional[GemmPrecisionPlan] = None,
+        experimental_lt_ffn: bool = False,
+        enable_cuda_graph: bool = True,
+        force_flash: bool = False,
+        profile_ranges: bool = False,
+    ) -> None:
         super().__init__()
         self.config = config
         self.backend = backend
+        if precision_plan is None:
+            if backend == "cuda":
+                precision_plan = GemmPrecisionPlan.strict(config.num_layers)
+            elif backend == "cuda-hybrid":
+                precision_plan = GemmPrecisionPlan.validated_hybrid(config.num_layers)
+            elif backend == "cuda-aggressive":
+                precision_plan = GemmPrecisionPlan.from_mask(
+                    VALIDATED_AGGRESSIVE_TF32_MASK, config.num_layers
+                )
+            else:
+                precision_plan = GemmPrecisionPlan.strict(config.num_layers)
+        precision_plan.validate(config.num_layers)
+        self.precision_plan = precision_plan
+        self.experimental_lt_ffn = experimental_lt_ffn
+        self.enable_cuda_graph = enable_cuda_graph
+        self.profile_ranges = profile_ranges
+        self._cuda_graph_states: Dict[bool, Tuple[object, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.layers = nn.ModuleList(
             [
                 OptimizedTransformerBlock(
-                    config.d_model, config.num_heads, config.ffn_dim
+                    config.d_model, config.num_heads, config.ffn_dim, force_flash
                 )
                 for _ in range(config.num_layers)
             ]
@@ -293,6 +422,55 @@ class UserOptimizedTransformer(nn.Module):
         self.register_buffer(
             "_empty_mask", torch.empty(0, dtype=torch.bool), persistent=False
         )
+        self.register_buffer(
+            "_lt_workspace", torch.empty(0, dtype=torch.uint8), persistent=False
+        )
+
+    def _apply(self, fn, recurse: bool = True):
+        # Captured graph tensors are deliberately not module buffers. Discard
+        # them before a device/dtype move so stale device pointers cannot replay.
+        self._cuda_graph_states.clear()
+        return super()._apply(fn, recurse=recurse)
+
+    def set_precision_plan(self, plan: GemmPrecisionPlan) -> None:
+        """Install an offline-search candidate and invalidate captured graphs."""
+        plan.validate(self.config.num_layers)
+        self.precision_plan = plan
+        self._cuda_graph_states.clear()
+
+    def prepare_aggressive_backend(self) -> None:
+        """Allocate and initialize optional resources before graph capture."""
+        if self.backend != "cuda-aggressive" or not self.experimental_lt_ffn:
+            return
+        if self._empty_mask.device.type != "cuda":
+            raise RuntimeError("move the aggressive model to CUDA before preparing it")
+        if self._lt_workspace.numel() == 0:
+            # cuBLASLt's heuristic is allowed up to 32 MiB and is selected only
+            # once. The allocation is persistent and excluded from inference.
+            self._lt_workspace = torch.empty(
+                32 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=self._empty_mask.device,
+            )
+        extension = get_cuda_extension(required=True)
+        if not hasattr(extension, "ffn_gelu_lt"):
+            raise RuntimeError("rebuild the CUDA extension to enable cuBLASLt FFN")
+        # Initialize both cached compute policies before CUDA Graph capture.
+        sample = torch.zeros(
+            self.config.batch_size,
+            self.config.seq_len,
+            self.config.d_model,
+            dtype=torch.float32,
+            device=self._empty_mask.device,
+        )
+        first = self.layers[0].ffn_in
+        extension.ffn_gelu_lt(
+            sample, first.weight, first.bias, self._lt_workspace, False
+        )
+        extension.ffn_gelu_lt(
+            sample, first.weight, first.bias, self._lt_workspace, True
+        )
+        torch.cuda.synchronize(sample.device)
 
     def _forward_pytorch(
         self,
@@ -318,7 +496,7 @@ class UserOptimizedTransformer(nn.Module):
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
 
-    def _forward_cuda(
+    def _forward_cuda_impl(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor],
@@ -332,27 +510,29 @@ class UserOptimizedTransformer(nn.Module):
             mask = valid_token_mask.contiguous()
             attention_mask = mask[:, None, None, :]
 
-        selective_tf32 = self.backend == "cuda-hybrid"
         previous_tf32 = torch.backends.cuda.matmul.allow_tf32
         try:
-            if selective_tf32:
-                torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cuda.matmul.allow_tf32 = False
 
             # The first LayerNorm cannot be fused with a preceding block. Each
             # subsequent norm is produced by the previous residual fusion.
             normalized = self.layers[0].norm1(x)
             for index, layer in enumerate(self.layers):
-                # Attention projections remain strict FP32. Causal attention
-                # was the most error-sensitive part of the stress matrix.
-                if selective_tf32:
-                    torch.backends.cuda.matmul.allow_tf32 = False
+                if self.profile_ranges:
+                    torch.cuda.nvtx.range_push(f"transformer_layer_{index}")
+                    torch.cuda.nvtx.range_push("attention")
                 attention_delta = layer.attention(
                     normalized,
                     attention_mask,
                     valid_token_mask,
                     self.config.causal,
                     include_output_bias=False,
+                    qkv_tf32=self.precision_plan.qkv[index],
+                    output_tf32=self.precision_plan.attention_out[index],
                 )
+                if self.profile_ranges:
+                    torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_push("attention_residual_layernorm")
                 x, ffn_input = extension.residual_bias_layer_norm(
                     x,
                     attention_delta,
@@ -363,19 +543,27 @@ class UserOptimizedTransformer(nn.Module):
                     layer.norm2.eps,
                     False,
                 )
+                if self.profile_ranges:
+                    torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_push("ffn")
 
-                # FFN matmuls dominate runtime. The first three expansion GEMMs
-                # and all contraction GEMMs use tensor cores; the conservative
-                # boundary keeps accumulated error below the strict threshold.
-                if selective_tf32:
-                    torch.backends.cuda.matmul.allow_tf32 = (
-                        index < HYBRID_TF32_FFN_EXPANSION_LAYERS
+                torch.backends.cuda.matmul.allow_tf32 = self.precision_plan.ffn_in[index]
+                if self.experimental_lt_ffn:
+                    hidden = extension.ffn_gelu_lt(
+                        ffn_input,
+                        layer.ffn_in.weight,
+                        layer.ffn_in.bias,
+                        self._lt_workspace,
+                        self.precision_plan.ffn_in[index],
                     )
-                hidden = F.linear(ffn_input, layer.ffn_in.weight, bias=None)
-                hidden = extension.bias_gelu(hidden, layer.ffn_in.bias)
-                if selective_tf32:
-                    torch.backends.cuda.matmul.allow_tf32 = True
+                else:
+                    hidden = F.linear(ffn_input, layer.ffn_in.weight, bias=None)
+                    hidden = extension.bias_gelu(hidden, layer.ffn_in.bias)
+                torch.backends.cuda.matmul.allow_tf32 = self.precision_plan.ffn_out[index]
                 ffn_delta = F.linear(hidden, layer.ffn_out.weight, bias=None)
+                if self.profile_ranges:
+                    torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_push("ffn_residual_layernorm")
 
                 last_layer = index + 1 == len(self.layers)
                 following_norm = (
@@ -391,17 +579,77 @@ class UserOptimizedTransformer(nn.Module):
                     following_norm.eps,
                     last_layer,
                 )
+                if self.profile_ranges:
+                    torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_pop()
             return normalized
         finally:
-            if selective_tf32:
-                torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    def _capture_cuda_graph(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> Tuple[object, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Capture one mask topology with persistent input/output storage."""
+        static_x = torch.empty_like(x)
+        if valid_token_mask is None:
+            static_mask = self._empty_mask
+            capture_mask = None
+        else:
+            static_mask = torch.empty_like(valid_token_mask, memory_format=torch.contiguous_format)
+            capture_mask = static_mask
+        static_x.copy_(x)
+        if valid_token_mask is not None:
+            static_mask.copy_(valid_token_mask)
+
+        # Lazy CUDA libraries and cuBLAS workspaces must be initialized on a
+        # side stream before capture. This happens once per mask topology.
+        capture_stream = torch.cuda.Stream(device=x.device)
+        capture_stream.wait_stream(torch.cuda.current_stream(x.device))
+        with torch.cuda.stream(capture_stream):
+            for _ in range(3):
+                self._forward_cuda_impl(static_x, capture_mask)
+        torch.cuda.current_stream(x.device).wait_stream(capture_stream)
+        torch.cuda.synchronize(x.device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = self._forward_cuda_impl(static_x, capture_mask)
+        return graph, static_x, static_mask, static_output
+
+    def _forward_cuda_graph(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        key = valid_token_mask is not None
+        state = self._cuda_graph_states.get(key)
+        if state is None:
+            state = self._capture_cuda_graph(x, valid_token_mask)
+            self._cuda_graph_states[key] = state
+        graph, static_x, static_mask, static_output = state
+        static_x.copy_(x)
+        if valid_token_mask is not None:
+            static_mask.copy_(valid_token_mask)
+        graph.replay()
+        return static_output
+
+    def _forward_cuda(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.backend == "cuda-aggressive" and self.enable_cuda_graph:
+            return self._forward_cuda_graph(x, valid_token_mask)
+        return self._forward_cuda_impl(x, valid_token_mask)
 
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.backend in ("cuda", "cuda-hybrid"):
+        if self.backend in ("cuda", "cuda-hybrid", "cuda-aggressive"):
             if not x.is_cuda or x.dtype != torch.float32:
                 raise RuntimeError("The custom backend requires CUDA float32 input")
             return self._forward_cuda(x, valid_token_mask)
@@ -504,7 +752,7 @@ def resolve_optimized_backend(
         return requested
 
     supported = custom_cuda_shape_supported(config, device, dtype)
-    if requested in ("cuda", "cuda-hybrid"):
+    if requested in ("cuda", "cuda-hybrid", "cuda-aggressive"):
         if not supported:
             raise ValueError(
                 f"--optimized-backend {requested} requires CUDA float32 and the default "
@@ -515,8 +763,11 @@ def resolve_optimized_backend(
 
     # Auto remains conservative: an extension must be present, eligible, and
     # have cleared the documented accuracy/performance gate on the target GPU.
-    if supported and AUTO_CUDA_VALIDATED and get_cuda_extension(required=False):
-        return AUTO_CUDA_BACKEND
+    if supported and get_cuda_extension(required=False):
+        if AGGRESSIVE_CUDA_VALIDATED:
+            return "cuda-aggressive"
+        if AUTO_CUDA_VALIDATED:
+            return AUTO_CUDA_BACKEND
     return "pytorch"
 
 
@@ -712,6 +963,61 @@ def run_accuracy_tests(
     return all_passed
 
 
+def run_cuda_graph_replay_tests(
+    baseline: nn.Module,
+    optimized: UserOptimizedTransformer,
+    config: TransformerConfig,
+    device: torch.device,
+    rtol: float,
+    atol: float,
+    seed: int,
+) -> bool:
+    """Exercise graph input copying and both optional-mask topologies."""
+    if optimized.backend != "cuda-aggressive" or not optimized.enable_cuda_graph:
+        return True
+    print("\n=== CUDA Graph replay checks ===")
+    checks: List[Tuple[str, torch.Tensor, Optional[torch.Tensor]]] = []
+    x, _ = generate_random_case(
+        config, device, torch.float32, seed + 70000, 0.0, 1.0
+    )
+    checks.append(("initial allocation", x, None))
+    checks.append(("different allocation", x.clone().mul_(0.75), None))
+    masked_x, mask = generate_random_case(
+        config, device, torch.float32, seed + 70001, 0.35, 1.0
+    )
+    checks.append(("masked allocation", masked_x, mask))
+    changed_mask = mask.clone() if mask is not None else None
+    if changed_mask is not None:
+        changed_mask[:, -8:] = False
+    checks.append(("changed mask values", masked_x, changed_mask))
+
+    passed = True
+    with torch.inference_mode():
+        for label, case_x, case_mask in checks:
+            reference = baseline(case_x, case_mask)
+            candidate = optimized(case_x, case_mask).clone()
+            result = compare_outputs(reference, candidate, rtol=rtol, atol=atol)
+            passed &= result.passed
+            print(
+                f"{label}: {'PASS' if result.passed else 'FAIL'} | "
+                f"max_abs={result.max_abs_error:.6g} | "
+                f"failed={result.failed_elements}/{result.total_elements}"
+            )
+
+        # Mutate the same allocation after its graph topology has been cached.
+        x.add_(0.03125)
+        result = compare_outputs(
+            baseline(x, None), optimized(x, None).clone(), rtol=rtol, atol=atol
+        )
+        passed &= result.passed
+        print(
+            f"same allocation mutated: {'PASS' if result.passed else 'FAIL'} | "
+            f"max_abs={result.max_abs_error:.6g} | "
+            f"failed={result.failed_elements}/{result.total_elements}"
+        )
+    return passed
+
+
 def percentile(values: List[float], q: float) -> float:
     if not values:
         raise ValueError("values must not be empty")
@@ -902,6 +1208,250 @@ def benchmark_models(
         )
 
 
+@dataclass
+class MatrixAccuracyResult:
+    passed: bool
+    cases: int
+    failed_elements: int
+    total_elements: int
+    max_abs_error: float
+    max_relative_error: float
+
+
+class ExpandedAccuracyHarness:
+    """Cache the 2*2*3*trials stress matrix for offline CUDA tuning."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        device: torch.device,
+        trials: int,
+        seed: int,
+        rtol: float,
+        atol: float,
+        use_lt_ffn: bool,
+    ) -> None:
+        self.device = device
+        self.rtol = rtol
+        self.atol = atol
+        self.entries: List[
+            Tuple[UserOptimizedTransformer, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+        ] = []
+        self.timing_entry: Optional[
+            Tuple[UserOptimizedTransformer, torch.Tensor, Optional[torch.Tensor]]
+        ] = None
+
+        for causal in (False, True):
+            case_config = replace(config, causal=causal)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            baseline = BaselineTransformer(case_config).to(device=device).eval()
+            optimized = UserOptimizedTransformer(
+                case_config,
+                backend="cuda-aggressive",
+                precision_plan=GemmPrecisionPlan.validated_hybrid(
+                    case_config.num_layers
+                ),
+                experimental_lt_ffn=use_lt_ffn,
+                enable_cuda_graph=False,
+            )
+            copy_model_weights(baseline, optimized)
+            optimized = optimized.to(device=device).eval()
+            optimized.prepare_aggressive_backend()
+
+            with torch.inference_mode():
+                for padding_ratio in (0.0, 0.35):
+                    for input_scale in (0.25, 1.0, 4.0):
+                        for trial in range(trials):
+                            x, mask = generate_random_case(
+                                case_config,
+                                device,
+                                torch.float32,
+                                seed + trial,
+                                padding_ratio,
+                                input_scale,
+                            )
+                            reference = baseline(x, mask)
+                            self.entries.append((optimized, x, mask, reference))
+                            if (
+                                self.timing_entry is None
+                                and not causal
+                                and padding_ratio == 0.0
+                                and input_scale == 1.0
+                            ):
+                                self.timing_entry = (optimized, x, mask)
+
+    def evaluate(
+        self, plan: GemmPrecisionPlan, verbose: bool = False
+    ) -> MatrixAccuracyResult:
+        models = {id(entry[0]): entry[0] for entry in self.entries}.values()
+        for model in models:
+            model.set_precision_plan(plan)
+
+        failed_elements = 0
+        total_elements = 0
+        max_abs_error = 0.0
+        max_relative_error = 0.0
+        with torch.inference_mode():
+            for index, (model, x, mask, reference) in enumerate(self.entries):
+                result = compare_outputs(
+                    reference, model(x, mask), rtol=self.rtol, atol=self.atol
+                )
+                failed_elements += result.failed_elements
+                total_elements += result.total_elements
+                max_abs_error = max(max_abs_error, result.max_abs_error)
+                max_relative_error = max(
+                    max_relative_error, result.max_relative_error
+                )
+                if verbose:
+                    print(
+                        f"matrix case {index + 1:02d}/{len(self.entries)}: "
+                        f"{'PASS' if result.passed else 'FAIL'} | "
+                        f"max_abs={result.max_abs_error:.6g} | "
+                        f"failed={result.failed_elements}/{result.total_elements}"
+                    )
+        return MatrixAccuracyResult(
+            passed=failed_elements == 0,
+            cases=len(self.entries),
+            failed_elements=failed_elements,
+            total_elements=total_elements,
+            max_abs_error=max_abs_error,
+            max_relative_error=max_relative_error,
+        )
+
+    def time_plan(
+        self, plan: GemmPrecisionPlan, warmup: int = 10, repeats: int = 30
+    ) -> TimingResult:
+        if self.timing_entry is None:
+            raise RuntimeError("expanded matrix has no timing case")
+        model, x, mask = self.timing_entry
+        model.set_precision_plan(plan)
+        warmup_model(model, x, mask, warmup, self.device)
+        return TimingResult(benchmark_once(model, x, mask, repeats, self.device))
+
+
+def search_tf32_precision_plan(
+    config: TransformerConfig,
+    device: torch.device,
+    trials: int,
+    seed: int,
+    rtol: float,
+    atol: float,
+    beam_width: int,
+    steps: int,
+    tuning_output: Optional[Path],
+) -> bool:
+    """Bounded beam search; never executes in the normal inference path."""
+    print("\n=== Offline aggressive TF32 search ===")
+    print(
+        "building the expanded reference matrix "
+        f"(2 causal * 2 padding * 3 scales * {trials} seeds)"
+    )
+    exact_harness = ExpandedAccuracyHarness(
+        config, device, trials, seed, rtol, atol, use_lt_ffn=False
+    )
+    initial = GemmPrecisionPlan.validated_hybrid(config.num_layers)
+    initial_accuracy = exact_harness.evaluate(initial)
+    if not initial_accuracy.passed:
+        print(
+            "validated hybrid seed failed expanded matrix: "
+            f"failed={initial_accuracy.failed_elements}/{initial_accuracy.total_elements}"
+        )
+        return False
+    initial_timing = exact_harness.time_plan(initial)
+    cache: Dict[int, Tuple[MatrixAccuracyResult, TimingResult]] = {
+        initial.to_mask(): (initial_accuracy, initial_timing)
+    }
+    beam: List[GemmPrecisionPlan] = [initial]
+    best = initial
+
+    for step in range(steps):
+        proposals: Dict[int, GemmPrecisionPlan] = {}
+        for plan in beam:
+            mask = plan.to_mask()
+            for bit in range(4 * config.num_layers):
+                if not mask & (1 << bit):
+                    candidate_mask = mask | (1 << bit)
+                    proposals[candidate_mask] = GemmPrecisionPlan.from_mask(
+                        candidate_mask, config.num_layers
+                    )
+        passing: List[Tuple[float, GemmPrecisionPlan]] = []
+        for index, (mask, candidate) in enumerate(proposals.items()):
+            if mask not in cache:
+                accuracy = exact_harness.evaluate(candidate)
+                if accuracy.passed:
+                    timing = exact_harness.time_plan(candidate)
+                    cache[mask] = (accuracy, timing)
+                else:
+                    cache[mask] = (accuracy, TimingResult([float("inf")]))
+            accuracy, timing = cache[mask]
+            print(
+                f"step={step + 1} candidate={index + 1}/{len(proposals)} "
+                f"mask=0x{mask:x} {'PASS' if accuracy.passed else 'FAIL'} "
+                f"median={timing.median_ms:.4f} ms"
+            )
+            if accuracy.passed:
+                passing.append((timing.median_ms, candidate))
+        if not passing:
+            break
+        passing.sort(key=lambda item: item[0])
+        beam = [candidate for _, candidate in passing[:beam_width]]
+        if passing[0][0] < cache[best.to_mask()][1].median_ms:
+            best = passing[0][1]
+
+    best_accuracy, best_timing = cache[best.to_mask()]
+    print(f"winning precision plan: {best.describe()}")
+    print(
+        f"exact-GELU median={best_timing.median_ms:.4f} ms, "
+        f"p90={best_timing.p90_ms:.4f} ms, max_abs={best_accuracy.max_abs_error:.6g}"
+    )
+
+    # Independently gate the cuBLASLt GELU epilogue against the winning exact
+    # path. It is recommended only with full correctness, >=3% median gain, and
+    # no more than 2% p90 regression.
+    lt_harness = ExpandedAccuracyHarness(
+        config, device, trials, seed, rtol, atol, use_lt_ffn=True
+    )
+    lt_accuracy = lt_harness.evaluate(best)
+    lt_timing = lt_harness.time_plan(best) if lt_accuracy.passed else None
+    lt_promoted = bool(
+        lt_timing is not None
+        and lt_timing.median_ms <= best_timing.median_ms * 0.97
+        and lt_timing.p90_ms <= best_timing.p90_ms * 1.02
+    )
+    print(
+        "cuBLASLt FFN gate: "
+        f"{'PROMOTE' if lt_promoted else 'KEEP EXACT GELU'} | "
+        f"accuracy={'PASS' if lt_accuracy.passed else 'FAIL'} | "
+        f"median={lt_timing.median_ms if lt_timing else float('nan'):.4f} ms"
+    )
+
+    report = {
+        "precision_mask": best.to_mask(),
+        "precision_mask_hex": hex(best.to_mask()),
+        "precision_plan": best.describe(),
+        "accuracy": best_accuracy.__dict__,
+        "exact_timing_ms": {
+            "median": best_timing.median_ms,
+            "p90": best_timing.p90_ms,
+            "minimum": best_timing.min_ms,
+        },
+        "cublaslt_ffn_promoted": lt_promoted,
+        "cublaslt_accuracy": lt_accuracy.__dict__,
+        "cublaslt_timing_ms": None
+        if lt_timing is None
+        else {
+            "median": lt_timing.median_ms,
+            "p90": lt_timing.p90_ms,
+            "minimum": lt_timing.min_ms,
+        },
+    }
+    if tuning_output is not None:
+        tuning_output.write_text(json.dumps(report, indent=2) + "\n")
+        print(f"wrote tuning report to {tuning_output}")
+    return True
+
+
 def maybe_compile(model: nn.Module, enabled: bool, mode: str) -> nn.Module:
     if not enabled:
         return model
@@ -947,9 +1497,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-user", action="store_true")
     parser.add_argument(
         "--optimized-backend",
-        choices=("auto", "pytorch", "cuda", "cuda-hybrid"),
+        choices=("auto", "pytorch", "cuda", "cuda-hybrid", "cuda-aggressive"),
         default="auto",
         help="auto uses only a CUDA backend that has passed the speed gate",
+    )
+    parser.add_argument(
+        "--precision-mask",
+        type=lambda value: int(value, 0),
+        help="override the custom backend's 4*layers TF32 bit mask (offline testing)",
+    )
+    parser.add_argument(
+        "--experimental-lt-ffn",
+        action="store_true",
+        help="test the unpromoted cuBLASLt fused FFN expansion",
+    )
+    parser.add_argument(
+        "--no-cuda-graph",
+        action="store_true",
+        help="disable CUDA Graph replay for cuda-aggressive",
+    )
+    parser.add_argument(
+        "--force-flash-attention",
+        action="store_true",
+        help="require the fused Flash SDPA backend; fail if this FP32 case is unsupported",
+    )
+    parser.add_argument(
+        "--profile-ranges",
+        action="store_true",
+        help="add per-layer attention/FFN NVTX ranges (use with CUDA Graph disabled)",
+    )
+    parser.add_argument(
+        "--expanded-accuracy",
+        action="store_true",
+        help="run causal/non-causal, padding, and input-scale stress validation",
+    )
+    parser.add_argument(
+        "--search-tf32-plan",
+        action="store_true",
+        help="offline beam search for a faster accuracy-safe per-GEMM TF32 plan",
+    )
+    parser.add_argument("--search-beam-width", type=int, default=4)
+    parser.add_argument("--search-steps", type=int, default=4)
+    parser.add_argument(
+        "--tuning-output",
+        type=Path,
+        help="write offline aggressive-tuning results as JSON",
     )
     parser.add_argument(
         "--compile-mode",
@@ -987,6 +1579,15 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("warmup must be non-negative")
     if args.repeats <= 0 or args.benchmark_rounds <= 0:
         raise ValueError("repeats and benchmark_rounds must be positive")
+    if args.search_beam_width <= 0 or args.search_steps <= 0:
+        raise ValueError("search beam width and steps must be positive")
+    if args.experimental_lt_ffn and device.type != "cuda":
+        raise ValueError("--experimental-lt-ffn requires CUDA")
+    if args.experimental_lt_ffn and args.optimized_backend not in (
+        "cuda-aggressive",
+        "auto",
+    ):
+        raise ValueError("--experimental-lt-ffn is only valid for cuda-aggressive")
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
 
@@ -1018,8 +1619,40 @@ def main() -> int:
         torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
 
+    if args.search_tf32_plan:
+        if not custom_cuda_shape_supported(config, device, dtype):
+            raise ValueError("TF32 search requires the default CUDA float32 shape")
+        get_cuda_extension(required=True)
+        return 0 if search_tf32_precision_plan(
+            config=config,
+            device=device,
+            trials=args.accuracy_trials,
+            seed=args.seed,
+            rtol=args.rtol,
+            atol=args.atol,
+            beam_width=args.search_beam_width,
+            steps=args.search_steps,
+            tuning_output=args.tuning_output,
+        ) else 2
+
+    precision_plan = None
+    if args.precision_mask is not None:
+        precision_plan = GemmPrecisionPlan.from_mask(
+            args.precision_mask, config.num_layers
+        )
+    use_lt_ffn = args.experimental_lt_ffn or (
+        optimized_backend == "cuda-aggressive" and AGGRESSIVE_LT_FFN_VALIDATED
+    )
     baseline = BaselineTransformer(config)
-    optimized = UserOptimizedTransformer(config, backend=optimized_backend)
+    optimized = UserOptimizedTransformer(
+        config,
+        backend=optimized_backend,
+        precision_plan=precision_plan,
+        experimental_lt_ffn=use_lt_ffn,
+        enable_cuda_graph=not args.no_cuda_graph,
+        force_flash=args.force_flash_attention,
+        profile_ranges=args.profile_ranges,
+    )
     copy_model_weights(
         baseline,
         optimized,
@@ -1028,11 +1661,13 @@ def main() -> int:
 
     baseline = baseline.to(device=device, dtype=dtype).eval()
     optimized = optimized.to(device=device, dtype=dtype).eval()
+    if optimized_backend == "cuda-aggressive":
+        optimized.prepare_aggressive_backend()
 
     # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
     compile_user = args.compile_user
-    if optimized_backend in ("cuda", "cuda-hybrid") and compile_user:
+    if optimized_backend in ("cuda", "cuda-hybrid", "cuda-aggressive") and compile_user:
         print(
             "[warning] --compile-user is ignored for the custom CUDA backend; "
             "its fused kernels are already CUDA Graph-capture compatible"
@@ -1049,6 +1684,49 @@ def main() -> int:
     )
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
+    if optimized_backend in ("cuda", "cuda-hybrid", "cuda-aggressive"):
+        print(f"precision_plan={optimized.precision_plan.describe()}")
+    if optimized_backend == "cuda-aggressive":
+        print(
+            f"cuda_graph={optimized.enable_cuda_graph}, "
+            f"cuBLASLt_FFN={optimized.experimental_lt_ffn}, "
+            f"forced_flash={args.force_flash_attention}"
+        )
+
+    if args.expanded_accuracy:
+        if not custom_cuda_shape_supported(config, device, dtype):
+            raise ValueError("expanded aggressive validation requires default CUDA FP32")
+        print("\n=== Expanded 60-case accuracy matrix ===")
+        matrix = ExpandedAccuracyHarness(
+            config,
+            device,
+            args.accuracy_trials,
+            args.seed,
+            args.rtol,
+            args.atol,
+            use_lt_ffn,
+        )
+        matrix_result = matrix.evaluate(optimized.precision_plan, verbose=True)
+        print(
+            f"expanded summary: {'PASS' if matrix_result.passed else 'FAIL'} | "
+            f"max_abs={matrix_result.max_abs_error:.6g} | "
+            f"max_rel={matrix_result.max_relative_error:.6g} | "
+            f"failed={matrix_result.failed_elements}/{matrix_result.total_elements}"
+        )
+        del matrix
+        torch.cuda.empty_cache()
+        if not matrix_result.passed and not args.benchmark_on_failure:
+            return 2
+
+    graph_passed = run_cuda_graph_replay_tests(
+        baseline=baseline,
+        optimized=optimized,
+        config=config,
+        device=device,
+        rtol=args.rtol,
+        atol=args.atol,
+        seed=args.seed,
+    )
 
     accuracy_passed = run_accuracy_tests(
         baseline=baseline,
@@ -1064,6 +1742,7 @@ def main() -> int:
         atol=args.atol,
     )
 
+    accuracy_passed &= graph_passed
     if not accuracy_passed and not args.benchmark_on_failure:
         print("\nPerformance benchmark skipped because accuracy validation failed.")
         print("Use --benchmark-on-failure to benchmark an incorrect implementation anyway.")

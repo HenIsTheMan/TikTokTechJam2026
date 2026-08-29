@@ -6,6 +6,13 @@ torch::Tensor bias_gelu_cuda(
     const torch::Tensor& input,
     const torch::Tensor& bias);
 
+torch::Tensor ffn_gelu_lt_cuda(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& workspace,
+    bool use_tf32);
+
 std::vector<torch::Tensor> residual_bias_layer_norm_cuda(
     const torch::Tensor& residual,
     const torch::Tensor& delta,
@@ -19,6 +26,8 @@ std::vector<torch::Tensor> residual_bias_layer_norm_cuda(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("bias_gelu", &bias_gelu_cuda,
              "Fused FP32 bias + exact GELU (CUDA)");
+  module.def("ffn_gelu_lt", &ffn_gelu_lt_cuda,
+             "Fixed-shape cuBLASLt FP32/TF32 FFN + bias + GELU (CUDA)");
   module.def("residual_bias_layer_norm", &residual_bias_layer_norm_cuda,
              "Fused FP32 residual + bias + mask + LayerNorm (CUDA)");
 }

@@ -36,6 +36,54 @@ make build-cuda
 make benchmark-all
 ```
 
+## Aggressive backend and offline promotion gate
+
+`cuda-aggressive` adds whole-forward CUDA Graph replay to the validated hybrid
+precision policy. It maintains separate masked and unmasked captures and copies
+every incoming input and mask into persistent graph storage before replay, so it
+remains correct for changing inputs. The first call captures the graph and is
+excluded by the normal warm-up.
+
+```bash
+make benchmark-aggressive
+make benchmark-best
+```
+
+The extension also contains an experimental fixed-shape cuBLASLt FFN expansion
+that fuses GEMM, bias and GELU. It is deliberately not enabled by `auto`: CUDA's
+GELU epilogue must pass the full output test and beat the exact-GELU path on the
+target GPU first. Run the offline tuner on the RTX 5090 to search a 24-bit,
+per-layer TF32 policy and evaluate the fused epilogue:
+
+```bash
+make tune-aggressive
+```
+
+The tuner checks causal and non-causal attention, zero and 35% padding, input
+scales 0.25/1/4, and five seeds. It promotes the cuBLASLt candidate in its JSON
+report only when every output passes, median latency improves by at least 3%,
+and p90 regresses by no more than 2%. Copy the reported precision mask into
+`VALIDATED_AGGRESSIVE_TF32_MASK`; set the two aggressive validation constants
+only after reviewing the report. Normal inference never searches algorithms or
+precision policies.
+
+Useful experimental and profiling commands:
+
+```bash
+python Sandbox.py --device cuda --dtype float32 \
+  --optimized-backend cuda-aggressive --expanded-accuracy
+
+python Sandbox.py --device cuda --dtype float32 \
+  --optimized-backend cuda-aggressive --experimental-lt-ffn
+
+make profile-aggressive
+```
+
+`--force-flash-attention` can be used to verify that this FP32 shape supports
+the fused Flash SDPA backend; it fails explicitly instead of silently selecting
+another SDPA implementation. The Nsight target records CUDA, NVTX and cuBLAS
+activity in `aggressive_profile.nsys-rep`.
+
 The build defaults to `/usr/local/cuda` and `TORCH_CUDA_ARCH_LIST=12.0`. Override
 either Make variable if needed. Generated binaries and build products are
 ignored by Git.

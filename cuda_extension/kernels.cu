@@ -6,9 +6,11 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cublasLt.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -18,6 +20,87 @@ constexpr int kFfnWidth = 2048;
 constexpr int kNormThreads = 128;
 constexpr int kElementwiseThreads = 256;
 constexpr float kInvSqrtTwo = 0.70710678118654752440f;
+constexpr int kTokenRows = 8 * 128;
+
+void check_cublas(cublasStatus_t status, const char* operation) {
+  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, operation,
+              " failed with cuBLAS status ", static_cast<int>(status));
+}
+
+struct LtFfnPlan {
+  cublasLtHandle_t handle = nullptr;
+  cublasLtMatmulDesc_t operation = nullptr;
+  cublasLtMatrixLayout_t weight_layout = nullptr;
+  cublasLtMatrixLayout_t input_layout = nullptr;
+  cublasLtMatrixLayout_t output_layout = nullptr;
+  cublasLtMatmulAlgo_t algorithm{};
+  size_t workspace_bytes = 0;
+  bool initialized = false;
+};
+
+LtFfnPlan lt_ffn_plans[2];
+std::mutex lt_ffn_mutex;
+
+void initialize_lt_ffn_plan(LtFfnPlan& plan, bool use_tf32, size_t workspace_bytes) {
+  if (plan.initialized) return;
+  const cublasComputeType_t compute_type =
+      use_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+  check_cublas(cublasLtCreate(&plan.handle), "cublasLtCreate");
+  check_cublas(
+      cublasLtMatmulDescCreate(&plan.operation, compute_type, CUDA_R_32F),
+      "cublasLtMatmulDescCreate");
+
+  // Row-major Y = X W^T is viewed as the column-major operation
+  // Y^T = W X^T, avoiding per-forward transposes or packed copies.
+  cublasOperation_t transpose = CUBLAS_OP_T;
+  check_cublas(
+      cublasLtMatmulDescSetAttribute(
+          plan.operation, CUBLASLT_MATMUL_DESC_TRANSA, &transpose,
+          sizeof(transpose)),
+      "set cuBLASLt transpose");
+  cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_GELU_BIAS;
+  check_cublas(
+      cublasLtMatmulDescSetAttribute(
+          plan.operation, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+          sizeof(epilogue)),
+      "set cuBLASLt GELU epilogue");
+
+  check_cublas(
+      cublasLtMatrixLayoutCreate(
+          &plan.weight_layout, CUDA_R_32F, kModelWidth, kFfnWidth, kModelWidth),
+      "create cuBLASLt weight layout");
+  check_cublas(
+      cublasLtMatrixLayoutCreate(
+          &plan.input_layout, CUDA_R_32F, kModelWidth, kTokenRows, kModelWidth),
+      "create cuBLASLt input layout");
+  check_cublas(
+      cublasLtMatrixLayoutCreate(
+          &plan.output_layout, CUDA_R_32F, kFfnWidth, kTokenRows, kFfnWidth),
+      "create cuBLASLt output layout");
+
+  cublasLtMatmulPreference_t preference = nullptr;
+  check_cublas(cublasLtMatmulPreferenceCreate(&preference),
+               "cublasLtMatmulPreferenceCreate");
+  check_cublas(
+      cublasLtMatmulPreferenceSetAttribute(
+          preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+          &workspace_bytes, sizeof(workspace_bytes)),
+      "set cuBLASLt workspace preference");
+  cublasLtMatmulHeuristicResult_t result{};
+  int returned = 0;
+  check_cublas(
+      cublasLtMatmulAlgoGetHeuristic(
+          plan.handle, plan.operation, plan.weight_layout, plan.input_layout,
+          plan.output_layout, plan.output_layout, preference, 1, &result, &returned),
+      "cublasLtMatmulAlgoGetHeuristic");
+  check_cublas(cublasLtMatmulPreferenceDestroy(preference),
+               "cublasLtMatmulPreferenceDestroy");
+  TORCH_CHECK(returned == 1 && result.state == CUBLAS_STATUS_SUCCESS,
+              "cuBLASLt found no fixed-shape FFN algorithm");
+  plan.algorithm = result.algo;
+  plan.workspace_bytes = result.workspaceSize;
+  plan.initialized = true;
+}
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -138,6 +221,59 @@ void check_cuda_fp32_contiguous(const torch::Tensor& tensor, const char* name) {
 }
 
 }  // namespace
+
+torch::Tensor ffn_gelu_lt_cuda(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& workspace,
+    bool use_tf32) {
+  check_cuda_fp32_contiguous(input, "input");
+  check_cuda_fp32_contiguous(weight, "weight");
+  check_cuda_fp32_contiguous(bias, "bias");
+  TORCH_CHECK(input.dim() == 3 && input.size(0) == 8 && input.size(1) == 128 &&
+                  input.size(2) == kModelWidth,
+              "ffn_gelu_lt requires input [8, 128, 512]");
+  TORCH_CHECK(weight.dim() == 2 && weight.size(0) == kFfnWidth &&
+                  weight.size(1) == kModelWidth,
+              "ffn_gelu_lt requires weight [2048, 512]");
+  TORCH_CHECK(bias.dim() == 1 && bias.numel() == kFfnWidth,
+              "ffn_gelu_lt requires bias [2048]");
+  TORCH_CHECK(workspace.is_cuda() && workspace.is_contiguous() &&
+                  workspace.scalar_type() == at::ScalarType::Byte,
+              "workspace must be a contiguous CUDA uint8 tensor");
+  TORCH_CHECK(input.device() == weight.device() && input.device() == bias.device() &&
+                  input.device() == workspace.device(),
+              "ffn_gelu_lt device mismatch");
+
+  c10::cuda::CUDAGuard device_guard(input.device());
+  auto output = torch::empty(
+      {input.size(0), input.size(1), kFfnWidth}, input.options());
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  std::lock_guard<std::mutex> guard(lt_ffn_mutex);
+  LtFfnPlan& plan = lt_ffn_plans[use_tf32 ? 1 : 0];
+  initialize_lt_ffn_plan(plan, use_tf32, workspace.numel());
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(plan.workspace_bytes),
+              "cuBLASLt workspace is too small");
+  const void* bias_pointer = bias.data_ptr<float>();
+  check_cublas(
+      cublasLtMatmulDescSetAttribute(
+          plan.operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer,
+          sizeof(bias_pointer)),
+      "set cuBLASLt bias pointer");
+  check_cublas(
+      cublasLtMatmul(
+          plan.handle, plan.operation, &alpha, weight.data_ptr<float>(),
+          plan.weight_layout, input.data_ptr<float>(), plan.input_layout, &beta,
+          output.data_ptr<float>(), plan.output_layout, output.data_ptr<float>(),
+          plan.output_layout, &plan.algorithm, workspace.data_ptr(),
+          plan.workspace_bytes, stream),
+      "cublasLtMatmul FFN GELU");
+  return output;
+}
 
 torch::Tensor bias_gelu_cuda(
     const torch::Tensor& input,
