@@ -75,12 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-baseline", action="store_true")
     parser.add_argument("--compile-user", action="store_true")
     parser.add_argument(
-        "--optimized-backend",
-        choices=("auto", "pytorch", "cuda", "cuda-hybrid"),
-        default="auto",
-        help="auto uses the custom CUDA backend only when its shape/build gate passes",
-    )
-    parser.add_argument(
         "--compile-mode",
         choices=("default", "reduce-overhead", "max-autotune"),
         default="default",
@@ -682,20 +676,15 @@ class UserOptimizedTransformerBlock(nn.Module):
 
 
 class UserOptimizedTransformer(nn.Module):
-    """Sandbox optimized Transformer with optional custom CUDA dispatch.
+    """Transformer with automatic PyTorch/CUDA inference dispatch.
 
-    backend="pytorch" always uses Sandbox's existing fused PyTorch forward.
-    backend="cuda" or "cuda-hybrid" uses the custom CUDA path from cuda.py.
-    backend="auto" selects the CUDA path only when its supported shape/backend
-    is available; otherwise it uses Sandbox's existing PyTorch path.
+    Eligible CUDA inputs use the custom CUDA implementation adapted from cuda.py.
+    All other inputs use Sandbox's existing fused PyTorch implementation.
     """
 
-    def __init__(self, config: TransformerConfig, backend: str = "auto") -> None:
+    def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
-        if backend not in ("auto", "pytorch", "cuda", "cuda-hybrid"):
-            raise ValueError(f"unknown backend: {backend}")
         self.config = config
-        self.backend = backend
         self.layers = nn.ModuleList(
             UserOptimizedTransformerBlock(
                 config.d_model, config.num_heads, config.ffn_dim
@@ -880,7 +869,8 @@ class UserOptimizedTransformer(nn.Module):
             mask = valid_token_mask.contiguous()
             attention_mask = mask[:, None, None, :]
 
-        selective_tf32 = self.backend == "cuda-hybrid"
+        # This path is only entered for the automatically selected CUDA backend.
+        selective_tf32 = True
         previous_tf32 = torch.backends.cuda.matmul.allow_tf32
         try:
             if selective_tf32:
@@ -972,24 +962,15 @@ class UserOptimizedTransformer(nn.Module):
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Explicit backend selection takes precedence. Auto uses CUDA only when
-        # the CUDA implementation is actually eligible and the extension exists.
-        if self.backend == "pytorch":
-            return self._forward_pytorch(x, valid_token_mask)
-        if self.backend in ("cuda", "cuda-hybrid"):
-            return self._forward_cuda(x, valid_token_mask)
+        """Automatically choose CUDA or the original PyTorch implementation."""
+        # The custom CUDA kernels are specialized for the configuration used by
+        # cuda.py and require CUDA float32 input plus a built extension.
+        if custom_cuda_shape_supported(self.config, x.device, x.dtype):
+            if get_cuda_extension(required=False) is not None:
+                return self._forward_cuda(x, valid_token_mask)
 
-        # backend == "auto"
-        if x.is_cuda and x.dtype == torch.float32:
-            supported = custom_cuda_shape_supported(self.config, x.device, x.dtype)
-            if supported and AUTO_CUDA_VALIDATED and get_cuda_extension(required=False):
-                original_backend = self.backend
-                self.backend = AUTO_CUDA_BACKEND
-                try:
-                    return self._forward_cuda(x, valid_token_mask)
-                finally:
-                    self.backend = original_backend
-
+        # CPU, non-float32 CUDA, unsupported shapes, or a missing extension all
+        # use the original Sandbox PyTorch implementation.
         return self._forward_pytorch(x, valid_token_mask)
 
 
@@ -1011,28 +992,6 @@ def custom_cuda_shape_supported(
     )
 
 
-def resolve_optimized_backend(
-    requested: str,
-    config: TransformerConfig,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> str:
-    if requested == "pytorch":
-        return requested
-
-    supported = custom_cuda_shape_supported(config, device, dtype)
-    if requested in ("cuda", "cuda-hybrid"):
-        if not supported:
-            raise ValueError(
-                f"--optimized-backend {requested} requires CUDA float32 and the default "
-                "8x128x512, 8-head, 2048-FFN, 6-layer configuration"
-            )
-        get_cuda_extension(required=True)
-        return requested
-
-    if supported and AUTO_CUDA_VALIDATED and get_cuda_extension(required=False):
-        return AUTO_CUDA_BACKEND
-    return "pytorch"
 
 
 # Entry Pt
@@ -1070,10 +1029,6 @@ def main() -> int:
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
     # End: PyTorch setup
 
-    optimized_backend = resolve_optimized_backend(
-        args.optimized_backend, config, device, dtype
-    )
-
     # Start: Logging of setup info
     print("=== Configuration ===")
     
@@ -1081,15 +1036,13 @@ def main() -> int:
     
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
     
-    print(f"optimized_backend={optimized_backend} (requested={args.optimized_backend})")
-
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
     # End: Logging of setup info
 
     baseline = BaselineTransformer(config)
     
-    optimized = UserOptimizedTransformer(config, backend=optimized_backend)
+    optimized = UserOptimizedTransformer(config)
     
     copy_model_weights(
         baseline,
@@ -1103,14 +1056,10 @@ def main() -> int:
 
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
     
-    compile_user = args.compile_user
-    if optimized_backend in ("cuda", "cuda-hybrid") and compile_user:
-        print(
-            "[warning] --compile-user is ignored for the custom CUDA backend; "
-            "its CUDA path is already specialized for inference"
-        )
-        compile_user = False
-    optimized = maybe_compile(optimized, compile_user, args.compile_mode)
+    # Keep the original compile option. The custom CUDA path is selected at
+    # runtime from the input/device, so compilation is intentionally not used
+    # as a backend-selection mechanism.
+    optimized = maybe_compile(optimized, args.compile_user, args.compile_mode)
 
     accuracy_passed = run_accuracy_tests(
         baseline=baseline,
