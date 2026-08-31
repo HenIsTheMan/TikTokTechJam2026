@@ -713,6 +713,7 @@ class UserOptimizedTransformer(nn.Module):
         self._sdpa_mask_cache: Optional[torch.Tensor] = None
         self._half_attention_weights = None
         self._half_ffn_weights = None
+        self._cpp_fast_parameters = None
         self._cuda_backend: Optional[str] = None
         self._empty_cuda_masks: dict[torch.device, torch.Tensor] = {}
         self._pack_qkv_weights()
@@ -748,6 +749,7 @@ class UserOptimizedTransformer(nn.Module):
         self._sdpa_mask_cache = None
         self._half_attention_weights = None
         self._half_ffn_weights = None
+        self._cpp_fast_parameters = None
         self._cuda_backend = None
         return result
 
@@ -852,6 +854,57 @@ class UserOptimizedTransformer(nn.Module):
                 )
             self._half_ffn_weights = weights
         return weights
+
+    def _get_cpp_fast_parameters(self):
+        parameters = self._cpp_fast_parameters
+        if parameters is None:
+            attention = self._get_half_attention_weights()
+            ffn = self._get_half_ffn_weights()
+            parameters = []
+            for i, layer in enumerate(self.layers):
+                next_norm = (
+                    self.layers[i + 1].norm1
+                    if i + 1 < len(self.layers)
+                    else self.final_norm
+                )
+                qkv_weight, qkv_bias, attention_weight = attention[i]
+                ffn_in_weight, ffn_in_bias, ffn_out_weight = ffn[i]
+                parameters.extend(
+                    (
+                        qkv_weight,
+                        qkv_bias,
+                        attention_weight,
+                        layer.out_proj.bias,
+                        layer.norm2.weight,
+                        layer.norm2.bias,
+                        layer.ffn_in.weight,
+                        layer.ffn_in.bias,
+                        ffn_in_weight,
+                        ffn_in_bias,
+                        layer.ffn_out.weight,
+                        ffn_out_weight,
+                        layer.ffn_out.bias,
+                        next_norm.weight,
+                        next_norm.bias,
+                    )
+                )
+            self._cpp_fast_parameters = parameters
+        return parameters
+
+    def _forward_cpp_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        empty_mask = self._empty_cuda_masks.get(x.device)
+        if empty_mask is None:
+            empty_mask = torch.empty(0, device=x.device, dtype=torch.bool)
+            self._empty_cuda_masks[x.device] = empty_mask
+        return _transformer_cuda_ext.transformer_forward(
+            x,
+            self.layers[0].norm1.weight,
+            self.layers[0].norm1.bias,
+            self._get_cpp_fast_parameters(),
+            empty_mask,
+            self.layers[0].norm1.eps,
+            self._num_heads,
+        )
 
     def _run_layer(
         self,
@@ -1066,10 +1119,15 @@ class UserOptimizedTransformer(nn.Module):
                     approximate="none",
                 )
             else:
-                hidden = _transformer_cuda_ext.bias_gelu(
-                    F.linear(norm2, layer.ffn_in.weight, None),
-                    layer.ffn_in.bias,
-                )
+                ffn_input = F.linear(norm2, layer.ffn_in.weight, None)
+                if half_ffn_out:
+                    hidden = _transformer_cuda_ext.bias_gelu_half(
+                        ffn_input, layer.ffn_in.bias
+                    )
+                else:
+                    hidden = _transformer_cuda_ext.bias_gelu(
+                        ffn_input, layer.ffn_in.bias
+                    )
             if half_ffn_out:
                 _, _, ffn_out_weight = half_ffn_weights[i]
                 ffn_delta = F.linear(hidden.half(), ffn_out_weight, None)
@@ -1135,6 +1193,7 @@ class UserOptimizedTransformer(nn.Module):
             _transformer_cuda_ext is not None
             and hasattr(_transformer_cuda_ext, "mixed_residual_bias_layer_norm")
             and hasattr(_transformer_cuda_ext, "layer_norm_half")
+            and hasattr(_transformer_cuda_ext, "bias_gelu_half")
             and x.dtype == torch.float32
             and self._d_model == 512
             and self.config.ffn_dim == 2048
@@ -1147,9 +1206,11 @@ class UserOptimizedTransformer(nn.Module):
             candidates["custom-fp16-attention"] = lambda: self._forward_custom_cuda(
                 x, valid_token_mask, half_attention=True
             )
-            candidates["custom-mixed-ffn"] = lambda: self._forward_custom_cuda(
-                x, valid_token_mask, half_attention=True, mixed_ffn=True
-            )
+            if (
+                len(self.layers) == 6
+                and hasattr(_transformer_cuda_ext, "transformer_forward")
+            ):
+                candidates["custom-mixed-ffn"] = lambda: self._forward_cpp_cuda(x)
 
         reference = (
             candidates["custom-fp32"]()
@@ -1293,9 +1354,7 @@ class UserOptimizedTransformer(nn.Module):
         if self._cuda_backend == "custom-fp16-attention":
             return self._forward_custom_cuda(x, valid_token_mask, half_attention=True)
         if self._cuda_backend == "custom-mixed-ffn":
-            return self._forward_custom_cuda(
-                x, valid_token_mask, half_attention=True, mixed_ffn=True
-            )
+            return self._forward_cpp_cuda(x)
         return self._forward_native(x, valid_token_mask)
 
 

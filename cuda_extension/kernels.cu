@@ -328,6 +328,37 @@ void bias_gelu_2048_kernel(
   }
 }
 
+__global__ __launch_bounds__(kGeluThreads, 2)
+void bias_gelu_2048_half_output_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ bias,
+    __half* __restrict__ output,
+    int rows) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int t = threadIdx.x;
+  const int base_vec = row * (kFfn / 4) + t;
+  const float4* in4 = reinterpret_cast<const float4*>(input);
+  const float4* b4 = reinterpret_cast<const float4*>(bias);
+  __half2* out2 = reinterpret_cast<__half2*>(output);
+#pragma unroll
+  for (int i = 0; i < (kFfn / 4) / kGeluThreads; ++i) {
+    const int v = base_vec + i * kGeluThreads;
+    const float4 a = in4[v];
+    const float4 b = b4[t + i * kGeluThreads];
+    const float x0 = a.x + b.x;
+    const float x1 = a.y + b.y;
+    const float x2 = a.z + b.z;
+    const float x3 = a.w + b.w;
+    const float y0 = 0.5f * x0 * (1.0f + erff(x0 * kInvSqrt2));
+    const float y1 = 0.5f * x1 * (1.0f + erff(x1 * kInvSqrt2));
+    const float y2 = 0.5f * x2 * (1.0f + erff(x2 * kInvSqrt2));
+    const float y3 = 0.5f * x3 * (1.0f + erff(x3 * kInvSqrt2));
+    out2[v * 2] = __floats2half2_rn(y0, y1);
+    out2[v * 2 + 1] = __floats2half2_rn(y2, y3);
+  }
+}
+
 inline void check_fp32_contiguous_cuda(const torch::Tensor& t, const char* name) {
   TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(t.scalar_type() == at::ScalarType::Float,
@@ -528,6 +559,32 @@ torch::Tensor bias_gelu_cuda(const torch::Tensor& input, const torch::Tensor& bi
   bias_gelu_2048_kernel<<<static_cast<int>(rows64), kGeluThreads, 0, stream>>>(
       input.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(),
       static_cast<int>(rows64));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
+
+torch::Tensor bias_gelu_half_cuda(
+    const torch::Tensor& input,
+    const torch::Tensor& bias) {
+  check_fp32_contiguous_cuda(input, "input");
+  check_fp32_contiguous_cuda(bias, "bias");
+  TORCH_CHECK(input.dim() >= 1 && input.size(-1) == kFfn,
+              "bias_gelu_half requires last dimension 2048");
+  TORCH_CHECK(bias.dim() == 1 && bias.numel() == kFfn,
+              "bias must contain 2048 elements");
+  TORCH_CHECK(input.device() == bias.device(), "device mismatch");
+  c10::cuda::CUDAGuard device_guard(input.device());
+  auto output = torch::empty(
+      input.sizes(), input.options().dtype(at::ScalarType::Half));
+  const int64_t rows64 = input.numel() / kFfn;
+  if (rows64 == 0) return output;
+  TORCH_CHECK(rows64 <= INT32_MAX, "input too large");
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+  bias_gelu_2048_half_output_kernel
+      <<<static_cast<int>(rows64), kGeluThreads, 0, stream>>>(
+          input.data_ptr<float>(), bias.data_ptr<float>(),
+          reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+          static_cast<int>(rows64));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }

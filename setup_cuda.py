@@ -23,6 +23,7 @@ setup(
             sources=[
                 str(ROOT / "cuda_extension" / "binding.cpp"),
                 str(ROOT / "cuda_extension" / "kernels.cu"),
+                str(ROOT / "cuda_extension" / "transformer_forward.cpp"),
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-DNDEBUG"],
