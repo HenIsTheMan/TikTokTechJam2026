@@ -114,6 +114,37 @@ def validate_some(args: argparse.Namespace, device: torch.device, dtype: torch.d
         print("[warning] float16 CPU kernels may be unsupported or slow")
 
 
+def validate_reference_memory(
+    config: "TransformerConfig", device: torch.device, dtype: torch.dtype
+) -> None:
+    """Reject reference configurations that would inevitably exhaust VRAM."""
+    if device.type != "cuda":
+        return
+    total_memory = torch.cuda.get_device_properties(device).total_memory
+    element_size = torch.empty((), dtype=dtype).element_size()
+    input_bytes = (
+        config.batch_size * config.seq_len * config.d_model * element_size
+    )
+    # Baseline attention materializes [B, H, S, S], and softmax is FP32.
+    score_bytes = (
+        config.batch_size
+        * config.num_heads
+        * config.seq_len
+        * config.seq_len
+        * 4
+    )
+    if input_bytes + score_bytes > total_memory // 2:
+        gib = 1024**3
+        raise ValueError(
+            "reference workload cannot fit safely on this GPU: "
+            f"input={input_bytes / gib:.2f} GiB, one FP32 attention score "
+            f"tensor={score_bytes / gib:.2f} GiB, GPU={total_memory / gib:.2f} "
+            "GiB. The explicit baseline also needs probabilities, Q/K/V, "
+            "residuals, and outputs. Reduce batch/sequence length or replace "
+            "the reference with a streaming-attention implementation."
+        )
+
+
 # Copy Model Weights (identical for BaselineTransformer and UserOptimizedTransformer)
 def copy_model_weights(
     baseline: nn.Module, optimized: nn.Module, strict: bool = True
@@ -714,6 +745,9 @@ class UserOptimizedTransformer(nn.Module):
         self._half_attention_weights = None
         self._half_ffn_weights = None
         self._cpp_fast_parameters = None
+        self._cpp_sdpa_parameters = None
+        self._compiled_sdpa = None
+        self._compiled_explicit = None
         self._cuda_backend: Optional[str] = None
         self._empty_cuda_masks: dict[torch.device, torch.Tensor] = {}
         self._pack_qkv_weights()
@@ -750,6 +784,9 @@ class UserOptimizedTransformer(nn.Module):
         self._half_attention_weights = None
         self._half_ffn_weights = None
         self._cpp_fast_parameters = None
+        self._cpp_sdpa_parameters = None
+        self._compiled_sdpa = None
+        self._compiled_explicit = None
         self._cuda_backend = None
         return result
 
@@ -906,6 +943,72 @@ class UserOptimizedTransformer(nn.Module):
             self._num_heads,
         )
 
+    def _get_cpp_sdpa_parameters(self):
+        parameters = self._cpp_sdpa_parameters
+        if parameters is None:
+            parameters = []
+            for i, layer in enumerate(self.layers):
+                parameters.extend(
+                    (
+                        self._qkv_weights[i],
+                        self._qkv_biases[i],
+                        layer.out_proj.weight,
+                        layer.out_proj.bias,
+                        layer.norm1.weight,
+                        layer.norm1.bias,
+                        layer.norm2.weight,
+                        layer.norm2.bias,
+                        layer.ffn_in.weight,
+                        layer.ffn_in.bias,
+                        layer.ffn_out.weight,
+                        layer.ffn_out.bias,
+                    )
+                )
+            self._cpp_sdpa_parameters = parameters
+        return parameters
+
+    def _forward_cpp_sdpa(self, x: torch.Tensor) -> torch.Tensor:
+        return _transformer_cuda_ext.transformer_forward_sdpa(
+            x,
+            self._get_cpp_sdpa_parameters(),
+            self.final_norm.weight,
+            self.final_norm.bias,
+            self.final_norm.eps,
+            self._num_heads,
+            self.config.causal,
+        )
+
+    def _get_compiled_sdpa(self):
+        compiled = self._compiled_sdpa
+        if compiled is None:
+            # Compile only the all-valid graph: mask construction and Python
+            # cache mutation would otherwise force graph breaks. Model shapes
+            # are fixed by TransformerConfig, so a static graph is ideal here.
+            compiled = torch.compile(
+                lambda input_tensor: self._forward_sdpa(input_tensor, None),
+                fullgraph=True,
+                mode="reduce-overhead",
+            )
+            self._compiled_sdpa = compiled
+        return compiled
+
+    def _forward_compiled_sdpa(self, x: torch.Tensor) -> torch.Tensor:
+        return self._get_compiled_sdpa()(x)
+
+    def _get_compiled_explicit(self):
+        compiled = self._compiled_explicit
+        if compiled is None:
+            compiled = torch.compile(
+                self._forward_explicit_packed,
+                fullgraph=True,
+                mode="reduce-overhead",
+            )
+            self._compiled_explicit = compiled
+        return compiled
+
+    def _forward_compiled_explicit(self, x: torch.Tensor) -> torch.Tensor:
+        return self._get_compiled_explicit()(x)
+
     def _run_layer(
         self,
         layer_index: int,
@@ -1008,6 +1111,179 @@ class UserOptimizedTransformer(nn.Module):
             if has_padding:
                 x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
+
+    def _forward_sdpa(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+        half_gemms: bool = False,
+    ) -> torch.Tensor:
+        """Shape-generic path with fused causal attention.
+
+        Residuals, LayerNorm and activation functions stay in FP32 when the
+        input is FP32.  The optional half path moves the projection/FFN GEMMs
+        to tensor cores while converting their deltas back before accumulation.
+        """
+        valid_token_mask = self._valid_mask_or_none(valid_token_mask)
+        batch, seq_len, _ = x.shape
+        head_dim = self._d_model // self._num_heads
+        attention_mask = None
+        is_causal = self.config.causal
+        if valid_token_mask is not None:
+            attention_mask = self._sdpa_attention_mask(
+                valid_token_mask, self.config.causal, seq_len
+            )
+            is_causal = False
+
+        half_attention = self._get_half_attention_weights() if half_gemms else None
+        half_ffn = self._get_half_ffn_weights() if half_gemms else None
+        for i, layer in enumerate(self.layers):
+            norm1 = F.layer_norm(
+                x,
+                (self._d_model,),
+                layer.norm1.weight,
+                layer.norm1.bias,
+                layer.norm1.eps,
+            )
+            if half_gemms:
+                qkv_weight, qkv_bias, out_weight = half_attention[i]
+                qkv = F.linear(norm1.half(), qkv_weight, qkv_bias)
+            else:
+                qkv = F.linear(norm1, self._qkv_weights[i], self._qkv_biases[i])
+                out_weight = layer.out_proj.weight
+            query, key, value = (
+                qkv.view(batch, seq_len, 3, self._num_heads, head_dim)
+                .permute(2, 0, 3, 1, 4)
+                .unbind(0)
+            )
+            context = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=is_causal,
+            )
+            if self.config.causal and attention_mask is None:
+                # FlashAttention's largest relative deviations occur in the
+                # first few triangular rows. Recompute that tiny prefix in the
+                # same FP32-softmax order as the reference and retain Flash for
+                # the rest of the sequence.
+                prefix = min(32, seq_len)
+                prefix_scores = torch.matmul(
+                    query[:, :, :prefix], key.transpose(-2, -1)
+                ) * (head_dim**-0.5)
+                query_positions = torch.arange(prefix, device=x.device)[:, None]
+                key_positions = torch.arange(seq_len, device=x.device)[None, :]
+                prefix_scores = prefix_scores.masked_fill(
+                    key_positions > query_positions, float("-inf")
+                )
+                prefix_probabilities = torch.softmax(
+                    prefix_scores.float(), dim=-1
+                ).to(query.dtype)
+                prefix_context = torch.matmul(prefix_probabilities, value)
+                context = torch.cat((prefix_context, context[:, :, prefix:]), dim=2)
+            context = context.transpose(1, 2).contiguous().view(
+                batch, seq_len, self._d_model
+            )
+            if half_gemms:
+                attention = F.linear(context, out_weight, None).float()
+                attention = attention + layer.out_proj.bias
+            else:
+                attention = F.linear(context, out_weight, layer.out_proj.bias)
+            x = x + attention.to(x.dtype)
+            norm2 = F.layer_norm(
+                x,
+                (self._d_model,),
+                layer.norm2.weight,
+                layer.norm2.bias,
+                layer.norm2.eps,
+            )
+            if half_gemms:
+                ffn_in_weight, ffn_in_bias, ffn_out_weight = half_ffn[i]
+                hidden = F.gelu(
+                    F.linear(norm2.half(), ffn_in_weight, ffn_in_bias),
+                    approximate="none",
+                )
+                ffn_delta = F.linear(hidden, ffn_out_weight, None).float()
+                ffn_delta = ffn_delta + layer.ffn_out.bias
+            else:
+                hidden = F.gelu(
+                    F.linear(norm2, layer.ffn_in.weight, layer.ffn_in.bias),
+                    approximate="none",
+                )
+                ffn_delta = F.linear(
+                    hidden, layer.ffn_out.weight, layer.ffn_out.bias
+                )
+            x = x + ffn_delta.to(x.dtype)
+
+        x = F.layer_norm(
+            x,
+            (self._d_model,),
+            self.final_norm.weight,
+            self.final_norm.bias,
+            self.final_norm.eps,
+        )
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
+
+    def _forward_explicit_packed(self, x: torch.Tensor) -> torch.Tensor:
+        """Reference-order attention with packed QKV for strict shapes."""
+        batch, seq_len, _ = x.shape
+        head_dim = self._d_model // self._num_heads
+        for i, layer in enumerate(self.layers):
+            norm1 = F.layer_norm(
+                x,
+                (self._d_model,),
+                layer.norm1.weight,
+                layer.norm1.bias,
+                layer.norm1.eps,
+            )
+            qkv = F.linear(norm1, self._qkv_weights[i], self._qkv_biases[i])
+            query, key, value = (
+                qkv.view(batch, seq_len, 3, self._num_heads, head_dim)
+                .permute(2, 0, 3, 1, 4)
+                .unbind(0)
+            )
+            scores = torch.matmul(query, key.transpose(-2, -1)) * (
+                head_dim**-0.5
+            )
+            if self.config.causal:
+                causal_mask = torch.ones(
+                    (seq_len, seq_len), device=x.device, dtype=torch.bool
+                ).triu(1)
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            probabilities = torch.softmax(scores.float(), dim=-1).to(x.dtype)
+            context = torch.matmul(probabilities, value)
+            context = context.transpose(1, 2).contiguous().view(
+                batch, seq_len, self._d_model
+            )
+            x = x + F.linear(
+                context, layer.out_proj.weight, layer.out_proj.bias
+            )
+            norm2 = F.layer_norm(
+                x,
+                (self._d_model,),
+                layer.norm2.weight,
+                layer.norm2.bias,
+                layer.norm2.eps,
+            )
+            x = x + F.linear(
+                F.gelu(
+                    F.linear(norm2, layer.ffn_in.weight, layer.ffn_in.bias),
+                    approximate="none",
+                ),
+                layer.ffn_out.weight,
+                layer.ffn_out.bias,
+            )
+        return F.layer_norm(
+            x,
+            (self._d_model,),
+            self.final_norm.weight,
+            self.final_norm.bias,
+            self.final_norm.eps,
+        )
 
     def _forward_custom_cuda(
         self,
@@ -1188,7 +1464,46 @@ class UserOptimizedTransformer(nn.Module):
     def _select_cuda_backend(
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
     ) -> str:
-        candidates = {"native": lambda: self._forward_native(x, valid_token_mask)}
+        if self.config.causal:
+            # The explicit path is both fast and reference-stable at the short
+            # sequence lengths in the challenge. Long sequences require the
+            # linear-memory FlashAttention path.
+            candidates = {}
+        else:
+            candidates = {
+                "native": lambda: self._forward_native(x, valid_token_mask),
+                "sdpa-fp32": lambda: self._forward_sdpa(x, valid_token_mask),
+            }
+        if (
+            not self.config.causal
+            and _transformer_cuda_ext is not None
+            and hasattr(_transformer_cuda_ext, "transformer_forward_sdpa")
+            and self._valid_mask_or_none(valid_token_mask) is None
+        ):
+            candidates["cpp-sdpa-fp32"] = lambda: self._forward_cpp_sdpa(x)
+        if (
+            hasattr(torch, "compile")
+            and self._valid_mask_or_none(valid_token_mask) is None
+        ):
+            score_elements = (
+                x.shape[0] * self._num_heads * x.shape[1] * x.shape[1]
+            )
+            if (
+                not self.config.causal
+                or x.shape[1] > 128
+                or score_elements > 100_000_000
+            ):
+                candidates["compiled-sdpa-fp32"] = lambda: (
+                    self._forward_compiled_sdpa(x)
+                )
+            if self.config.causal and x.shape[1] <= 128:
+                candidates["compiled-explicit-fp32"] = lambda: (
+                    self._forward_compiled_explicit(x)
+                )
+        if x.dtype == torch.float32 and not self.config.causal:
+            candidates["sdpa-fp16-gemms"] = lambda: self._forward_sdpa(
+                x, valid_token_mask, half_gemms=True
+            )
         custom_eligible = (
             _transformer_cuda_ext is not None
             and hasattr(_transformer_cuda_ext, "mixed_residual_bias_layer_norm")
@@ -1199,7 +1514,7 @@ class UserOptimizedTransformer(nn.Module):
             and self.config.ffn_dim == 2048
             and x.is_contiguous()
         )
-        if custom_eligible:
+        if custom_eligible and not self.config.causal:
             candidates["custom-fp32"] = lambda: self._forward_custom_cuda(
                 x, valid_token_mask, half_attention=False
             )
@@ -1208,18 +1523,26 @@ class UserOptimizedTransformer(nn.Module):
             )
             if (
                 len(self.layers) == 6
+                and not self.config.causal
                 and hasattr(_transformer_cuda_ext, "transformer_forward")
             ):
                 candidates["custom-mixed-ffn"] = lambda: self._forward_cpp_cuda(x)
 
-        reference = (
-            candidates["custom-fp32"]()
-            if "custom-fp32" in candidates
-            else candidates["native"]()
-        )
-        accurate = {"native": candidates["native"]}
+        if self.config.causal:
+            reference = self._forward_exact_cuda(x, valid_token_mask)
+            candidates["exact"] = lambda: self._forward_exact_cuda(
+                x, valid_token_mask
+            )
+            accurate = {"exact": candidates["exact"]}
+        else:
+            reference = (
+                candidates["custom-fp32"]()
+                if "custom-fp32" in candidates
+                else candidates["native"]()
+            )
+            accurate = {"native": candidates["native"]}
         for name, candidate_fn in candidates.items():
-            if name == "native":
+            if name in accurate:
                 continue
             if self._candidate_is_accurate(reference, candidate_fn()):
                 accurate[name] = candidate_fn
@@ -1355,6 +1678,16 @@ class UserOptimizedTransformer(nn.Module):
             return self._forward_custom_cuda(x, valid_token_mask, half_attention=True)
         if self._cuda_backend == "custom-mixed-ffn":
             return self._forward_cpp_cuda(x)
+        if self._cuda_backend == "sdpa-fp32":
+            return self._forward_sdpa(x, valid_token_mask)
+        if self._cuda_backend == "sdpa-fp16-gemms":
+            return self._forward_sdpa(x, valid_token_mask, half_gemms=True)
+        if self._cuda_backend == "cpp-sdpa-fp32":
+            return self._forward_cpp_sdpa(x)
+        if self._cuda_backend == "compiled-sdpa-fp32":
+            return self._forward_compiled_sdpa(x)
+        if self._cuda_backend == "compiled-explicit-fp32":
+            return self._forward_compiled_explicit(x)
         return self._forward_native(x, valid_token_mask)
 
 
@@ -1380,6 +1713,7 @@ def main() -> int:
     )
 
     config.validate()
+    validate_reference_memory(config, device, dtype)
     # End: Initial setup
 
     # Start: PyTorch setup

@@ -57,6 +57,15 @@ torch::Tensor transformer_forward_cuda(
     double eps,
     int64_t num_heads);
 
+torch::Tensor transformer_forward_sdpa_cuda(
+    const torch::Tensor& input,
+    const std::vector<torch::Tensor>& parameters,
+    const torch::Tensor& final_norm_weight,
+    const torch::Tensor& final_norm_bias,
+    double eps,
+    int64_t num_heads,
+    bool causal);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("bias_gelu", &bias_gelu_cuda, "Fused FP32 bias + exact GELU (CUDA)");
   module.def("bias_gelu_half", &bias_gelu_half_cuda,
@@ -74,4 +83,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "Fused mixed-precision residual + bias + LayerNorm (CUDA)");
   module.def("transformer_forward", &transformer_forward_cuda,
              "Six-layer mixed-precision Transformer forward (CUDA)");
+  module.def("transformer_forward_sdpa", &transformer_forward_sdpa_cuda,
+             "Shape-generic fused-SDPA Transformer forward (CUDA)");
 }

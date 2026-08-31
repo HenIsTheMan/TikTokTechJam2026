@@ -1,10 +1,61 @@
 #include <ATen/ATen.h>
 #include <ATen/ops/gelu.h>
+#include <ATen/ops/layer_norm.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <torch/extension.h>
 
 #include <vector>
+
+torch::Tensor transformer_forward_sdpa_cuda(
+    const torch::Tensor& input,
+    const std::vector<torch::Tensor>& parameters,
+    const torch::Tensor& final_norm_weight,
+    const torch::Tensor& final_norm_bias,
+    double eps,
+    int64_t num_heads,
+    bool causal) {
+  constexpr int64_t kParamsPerLayer = 12;
+  TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+  TORCH_CHECK(input.dim() == 3, "input must have shape [B, S, D]");
+  TORCH_CHECK(parameters.size() % kParamsPerLayer == 0,
+              "invalid packed parameter count");
+  const int64_t layers = parameters.size() / kParamsPerLayer;
+  const int64_t batch = input.size(0);
+  const int64_t sequence = input.size(1);
+  const int64_t d_model = input.size(2);
+  TORCH_CHECK(d_model % num_heads == 0, "invalid head count");
+  const int64_t head_dim = d_model / num_heads;
+  auto residual = input;
+
+  for (int64_t layer = 0; layer < layers; ++layer) {
+    const int64_t p = layer * kParamsPerLayer;
+    // qkv weight/bias, output weight/bias, norm1 weight/bias,
+    // norm2 weight/bias, FFN-in weight/bias, FFN-out weight/bias.
+    auto norm1 = at::layer_norm(
+        residual, {d_model}, parameters[p + 4], parameters[p + 5], eps, true);
+    auto qkv = at::linear(norm1, parameters[p], parameters[p + 1]);
+    qkv = qkv.view({batch, sequence, 3, num_heads, head_dim})
+              .permute({2, 0, 3, 1, 4});
+    auto query = qkv.select(0, 0);
+    auto key = qkv.select(0, 1);
+    auto value = qkv.select(0, 2);
+    auto context = at::scaled_dot_product_attention(
+        query, key, value, std::nullopt, 0.0, causal, std::nullopt, false);
+    context = context.transpose(1, 2).contiguous().view(
+        {batch, sequence, d_model});
+    residual = residual + at::linear(
+        context, parameters[p + 2], parameters[p + 3]);
+    auto norm2 = at::layer_norm(
+        residual, {d_model}, parameters[p + 6], parameters[p + 7], eps, true);
+    auto hidden = at::gelu(
+        at::linear(norm2, parameters[p + 8], parameters[p + 9]), "none");
+    residual = residual + at::linear(
+        hidden, parameters[p + 10], parameters[p + 11]);
+  }
+  return at::layer_norm(
+      residual, {d_model}, final_norm_weight, final_norm_bias, eps, true);
+}
 
 torch::Tensor layer_norm_half_cuda(
     const torch::Tensor& input,
