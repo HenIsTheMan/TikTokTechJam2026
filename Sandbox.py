@@ -960,13 +960,21 @@ class UserOptimizedTransformer(nn.Module):
             is_causal = False
             extension_mask = valid_token_mask
 
-        norm = F.layer_norm(
-            x,
-            (self._d_model,),
-            self.layers[0].norm1.weight,
-            self.layers[0].norm1.bias,
-            self.layers[0].norm1.eps,
-        )
+        if half_attention:
+            norm = _transformer_cuda_ext.layer_norm_half(
+                x,
+                self.layers[0].norm1.weight,
+                self.layers[0].norm1.bias,
+                self.layers[0].norm1.eps,
+            )
+        else:
+            norm = F.layer_norm(
+                x,
+                (self._d_model,),
+                self.layers[0].norm1.weight,
+                self.layers[0].norm1.bias,
+                self.layers[0].norm1.eps,
+            )
         residual = x
         half_weights = self._get_half_attention_weights() if half_attention else None
         head_dim = self._d_model // self._num_heads
@@ -997,20 +1005,35 @@ class UserOptimizedTransformer(nn.Module):
                 .view(batch, seq_len, self._d_model)
             )
             if half_attention:
-                attention_delta = F.linear(context, out_weight, None).float()
+                attention_delta = F.linear(context, out_weight, None)
             else:
                 attention_delta = F.linear(context, layer.out_proj.weight, None)
 
-            residual, norm2 = _transformer_cuda_ext.residual_bias_layer_norm(
-                residual,
-                attention_delta,
-                layer.out_proj.bias,
-                layer.norm2.weight,
-                layer.norm2.bias,
-                extension_mask,
-                layer.norm2.eps,
-                False,
-            )
+            if half_attention:
+                residual, norm2 = (
+                    _transformer_cuda_ext.mixed_residual_bias_layer_norm(
+                        residual,
+                        attention_delta,
+                        layer.out_proj.bias,
+                        layer.norm2.weight,
+                        layer.norm2.bias,
+                        extension_mask,
+                        layer.norm2.eps,
+                        False,
+                        False,
+                    )
+                )
+            else:
+                residual, norm2 = _transformer_cuda_ext.residual_bias_layer_norm(
+                    residual,
+                    attention_delta,
+                    layer.out_proj.bias,
+                    layer.norm2.weight,
+                    layer.norm2.bias,
+                    extension_mask,
+                    layer.norm2.eps,
+                    False,
+                )
             hidden = _transformer_cuda_ext.bias_gelu(
                 F.linear(norm2, layer.ffn_in.weight, None),
                 layer.ffn_in.bias,
@@ -1021,16 +1044,31 @@ class UserOptimizedTransformer(nn.Module):
                 if i + 1 < len(self.layers)
                 else self.final_norm
             )
-            residual, norm = _transformer_cuda_ext.residual_bias_layer_norm(
-                residual,
-                ffn_delta,
-                layer.ffn_out.bias,
-                next_norm.weight,
-                next_norm.bias,
-                extension_mask,
-                next_norm.eps,
-                i + 1 == len(self.layers),
-            )
+            if half_attention and i + 1 < len(self.layers):
+                residual, norm = (
+                    _transformer_cuda_ext.mixed_residual_bias_layer_norm(
+                        residual,
+                        ffn_delta,
+                        layer.ffn_out.bias,
+                        next_norm.weight,
+                        next_norm.bias,
+                        extension_mask,
+                        next_norm.eps,
+                        True,
+                        False,
+                    )
+                )
+            else:
+                residual, norm = _transformer_cuda_ext.residual_bias_layer_norm(
+                    residual,
+                    ffn_delta,
+                    layer.ffn_out.bias,
+                    next_norm.weight,
+                    next_norm.bias,
+                    extension_mask,
+                    next_norm.eps,
+                    i + 1 == len(self.layers),
+                )
         return norm
 
     @staticmethod
@@ -1045,6 +1083,8 @@ class UserOptimizedTransformer(nn.Module):
         candidates = {"native": lambda: self._forward_native(x, valid_token_mask)}
         custom_eligible = (
             _transformer_cuda_ext is not None
+            and hasattr(_transformer_cuda_ext, "mixed_residual_bias_layer_norm")
+            and hasattr(_transformer_cuda_ext, "layer_norm_half")
             and x.dtype == torch.float32
             and self._d_model == 512
             and self.config.ffn_dim == 2048
