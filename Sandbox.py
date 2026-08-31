@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import argparse
 import copy
@@ -12,30 +12,6 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# Optional custom CUDA backend, adapted from cuda.py.
-AUTO_CUDA_VALIDATED = True
-AUTO_CUDA_BACKEND = "cuda-hybrid"
-HYBRID_TF32_FFN_EXPANSION_LAYERS = 3
-_cuda_extension = None
-
-
-def get_cuda_extension(required: bool = True):
-    """Load the pre-built CUDA extension without compiling it at runtime."""
-    global _cuda_extension
-    if _cuda_extension is not None:
-        return _cuda_extension
-    try:
-        import transformer_cuda_ext
-    except ImportError as error:
-        if required:
-            raise RuntimeError(
-                "The CUDA backend is not built. Run `make build-cuda` first."
-            ) from error
-        return None
-    _cuda_extension = transformer_cuda_ext
-    return _cuda_extension
 
 
 # Parse Cmd-Line Args
@@ -656,13 +632,14 @@ class BaselineTransformer(nn.Module): # nn.Module is base class
 
 
 class UserOptimizedTransformerBlock(nn.Module):
-    """Standalone transformer block containing only optimized parameters."""
+    """Weight-compatible container used by the fused inference path."""
 
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
 
+        # Keep the original parameter names so baseline state_dicts load directly.
         self.d_model = d_model
         self.num_heads = num_heads
         self.norm1 = nn.LayerNorm(d_model)
@@ -676,10 +653,12 @@ class UserOptimizedTransformerBlock(nn.Module):
 
 
 class UserOptimizedTransformer(nn.Module):
-    """Transformer with automatic PyTorch/CUDA inference dispatch.
+    """Aggressively optimized inference implementation.
 
-    Eligible CUDA inputs use the custom CUDA implementation adapted from cuda.py.
-    All other inputs use Sandbox's existing fused PyTorch implementation.
+    The previous custom CUDA route wrapped SDPA and several standalone GEMMs around
+    per-layer Python/framework work, while the baseline already uses PyTorch's
+    fused Transformer encoder kernel. This implementation keeps the required
+    parameter layout but executes the fused kernel directly on CUDA and CPU.
     """
 
     def __init__(self, config: TransformerConfig) -> None:
@@ -692,10 +671,11 @@ class UserOptimizedTransformer(nn.Module):
             for _ in range(config.num_layers)
         )
         self.final_norm = nn.LayerNorm(config.d_model)
-
         self._d_model = config.d_model
         self._num_heads = config.num_heads
 
+        # One packed QKV tensor per layer: this is exactly what the fused encoder
+        # primitive consumes and avoids three separate projection dispatches.
         self.register_buffer(
             "_qkv_weights",
             torch.empty(
@@ -716,19 +696,14 @@ class UserOptimizedTransformer(nn.Module):
             persistent=False,
         )
 
-        self._causal_mask_cache: Dict[Tuple[torch.device, int], torch.Tensor] = {}
-        self._mask_cache_key: Optional[Tuple[int, int]] = None
+        # Only one causal-mask object per (device, sequence length).
+        self._causal_mask_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
+        self._mask_cache_key: Optional[tuple[int, int]] = None
         self._mask_is_all_valid = False
-
-        self.register_buffer(
-            "_empty_mask", torch.empty(0, dtype=torch.bool), persistent=False
-        )
-
         self._pack_qkv_weights()
 
     @torch.no_grad()
     def _pack_qkv_weights(self) -> None:
-        """Pack Sandbox's separate Q/K/V parameters for its fused PyTorch path."""
         d = self._d_model
         for i, layer in enumerate(self.layers):
             self._qkv_weights[i, :d].copy_(layer.q_proj.weight)
@@ -739,7 +714,7 @@ class UserOptimizedTransformer(nn.Module):
             self._qkv_biases[i, 2 * d:].copy_(layer.v_proj.bias)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Load baseline weights and rebuild packed QKV buffers."""
+        # Baseline names include layers.*.attention.*, optimized names do not.
         remapped = state_dict.copy()
         for key in list(remapped):
             if key.startswith("layers.") and ".attention." in key:
@@ -773,12 +748,9 @@ class UserOptimizedTransformer(nn.Module):
         key = (device, seq_len)
         mask = self._causal_mask_cache.get(key)
         if mask is None:
-            mask = torch.ones(
-                (seq_len, seq_len), device=device, dtype=torch.bool
-            ).triu(1)
-            mask = mask.view(1, 1, seq_len, seq_len).expand(
-                1, self._num_heads, seq_len, seq_len
-            )
+            # mask_type=2 expects [1, H, S, S]. Expand is zero-copy.
+            mask = torch.ones((seq_len, seq_len), device=device, dtype=torch.bool).triu(1)
+            mask = mask.view(1, 1, seq_len, seq_len).expand(1, self._num_heads, seq_len, seq_len)
             self._causal_mask_cache[key] = mask
         return mask
 
@@ -789,7 +761,6 @@ class UserOptimizedTransformer(nn.Module):
         mask: Optional[torch.Tensor],
         mask_type: Optional[int],
     ) -> torch.Tensor:
-        """Sandbox's existing fused PyTorch Transformer encoder primitive."""
         layer = self.layers[layer_index]
         return torch._transformer_encoder_layer_fwd(
             x,
@@ -814,12 +785,16 @@ class UserOptimizedTransformer(nn.Module):
             mask_type,
         )
 
-    def _forward_pytorch(
+    def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Original Sandbox forward implementation."""
+        # Inference-only fused path. The benchmark already executes under
+        # inference_mode, and this keeps accidental training use explicit.
+        if torch.is_grad_enabled():
+            raise RuntimeError("UserOptimizedTransformer is inference-only")
+
         valid_token_mask = self._valid_mask_or_none(valid_token_mask)
         has_padding = valid_token_mask is not None
 
@@ -831,7 +806,8 @@ class UserOptimizedTransformer(nn.Module):
             if self.config.causal:
                 mask = self._causal_mask(x.device, seq_len)
                 if has_padding:
-                    mask = mask | (~valid_token_mask).view(1, 1, -1, seq_len)
+                    # Broadcast causal [1,H,S,S] across batch and combine key padding [B,1,1,S].
+                    mask = mask | (~valid_token_mask).view(-1, 1, 1, seq_len)
                 mask_type = 2
             else:
                 mask = ~valid_token_mask
@@ -850,148 +826,6 @@ class UserOptimizedTransformer(nn.Module):
         if has_padding:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
-
-    def _forward_cuda(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """CUDA inference implementation adapted from cuda.py."""
-        if torch.is_grad_enabled():
-            raise RuntimeError("The custom CUDA backend supports inference only")
-        if not x.is_cuda or x.dtype != torch.float32:
-            raise RuntimeError("The custom CUDA backend requires CUDA float32 input")
-
-        extension = get_cuda_extension(required=True)
-        mask = self._empty_mask
-        attention_mask: Optional[torch.Tensor] = None
-        if valid_token_mask is not None:
-            mask = valid_token_mask.contiguous()
-            attention_mask = mask[:, None, None, :]
-
-        # This path is only entered for the automatically selected CUDA backend.
-        selective_tf32 = True
-        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-        try:
-            if selective_tf32:
-                torch.backends.cuda.matmul.allow_tf32 = False
-
-            normalized = self.layers[0].norm1(x)
-            for index, layer in enumerate(self.layers):
-                if selective_tf32:
-                    torch.backends.cuda.matmul.allow_tf32 = False
-
-                batch, seq_len, _ = normalized.shape
-                head_dim = self._d_model // self._num_heads
-                qkv = F.linear(
-                    normalized,
-                    self._qkv_weights[index],
-                    self._qkv_biases[index],
-                ).view(batch, seq_len, 3, self._num_heads, head_dim)
-                q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-
-                # Match cuda.py's attention computation. When padding is present
-                # together with causal attention, combine both restrictions into
-                # one explicit boolean mask because SDPA does not accept both a
-                # non-None attn_mask and is_causal=True simultaneously.
-                if self.config.causal and attention_mask is not None:
-                    causal = torch.ones(
-                        (seq_len, seq_len), device=x.device, dtype=torch.bool
-                    ).triu(1)
-                    allowed = (~causal)[None, None, :, :] & attention_mask
-                    context = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=allowed, dropout_p=0.0, is_causal=False
-                    )
-                else:
-                    context = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=attention_mask,
-                        dropout_p=0.0,
-                        is_causal=self.config.causal,
-                    )
-                context = context.transpose(1, 2).reshape(
-                    batch, seq_len, self._d_model
-                )
-                attention_delta = F.linear(
-                    context, layer.out_proj.weight, bias=None
-                )
-
-                x, ffn_input = extension.residual_bias_layer_norm(
-                    x,
-                    attention_delta,
-                    layer.out_proj.bias,
-                    layer.norm2.weight,
-                    layer.norm2.bias,
-                    mask,
-                    layer.norm2.eps,
-                    False,
-                )
-
-                if selective_tf32:
-                    torch.backends.cuda.matmul.allow_tf32 = (
-                        index < HYBRID_TF32_FFN_EXPANSION_LAYERS
-                    )
-                hidden = F.linear(ffn_input, layer.ffn_in.weight, bias=None)
-                hidden = extension.bias_gelu(hidden, layer.ffn_in.bias)
-                if selective_tf32:
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                ffn_delta = F.linear(hidden, layer.ffn_out.weight, bias=None)
-
-                last_layer = index + 1 == len(self.layers)
-                following_norm = (
-                    self.final_norm if last_layer else self.layers[index + 1].norm1
-                )
-                x, normalized = extension.residual_bias_layer_norm(
-                    x,
-                    ffn_delta,
-                    layer.ffn_out.bias,
-                    following_norm.weight,
-                    following_norm.bias,
-                    mask,
-                    following_norm.eps,
-                    last_layer,
-                )
-
-            return normalized
-        finally:
-            if selective_tf32:
-                torch.backends.cuda.matmul.allow_tf32 = previous_tf32
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Automatically choose CUDA or the original PyTorch implementation."""
-        # The custom CUDA kernels are specialized for the configuration used by
-        # cuda.py and require CUDA float32 input plus a built extension.
-        if custom_cuda_shape_supported(self.config, x.device, x.dtype):
-            if get_cuda_extension(required=False) is not None:
-                return self._forward_cuda(x, valid_token_mask)
-
-        # CPU, non-float32 CUDA, unsupported shapes, or a missing extension all
-        # use the original Sandbox PyTorch implementation.
-        return self._forward_pytorch(x, valid_token_mask)
-
-
-def custom_cuda_shape_supported(
-    config: TransformerConfig,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> bool:
-    """Shape/device gate copied from cuda.py for the custom kernels."""
-    return (
-        device.type == "cuda"
-        and dtype == torch.float32
-        and config.batch_size == 8
-        and config.seq_len == 128
-        and config.d_model == 512
-        and config.num_heads == 8
-        and config.ffn_dim == 2048
-        and config.num_layers == 6
-    )
-
-
 
 
 # Entry Pt
