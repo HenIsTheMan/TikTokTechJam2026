@@ -1,8 +1,7 @@
 ## Setup
 * python3 -m venv venv
 * source venv/bin/activate
-* pip install numpy
-* pip install torch
+* pip install ninja numpy torch
 
 ## Run
 * python3 Sandbox.py --warmup 7 --repeats 5 --benchmark-rounds 2
