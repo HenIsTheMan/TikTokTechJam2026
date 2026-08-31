@@ -13,6 +13,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import transformer_cuda_ext as _transformer_cuda_ext
+except (ImportError, OSError):
+    # CPU execution and CUDA runs without a built extension keep the native path.
+    _transformer_cuda_ext = None
+
 
 # Parse Cmd-Line Args
 def parse_args() -> argparse.Namespace:
@@ -698,8 +704,16 @@ class UserOptimizedTransformer(nn.Module):
 
         # Only one causal-mask object per (device, sequence length).
         self._causal_mask_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
-        self._mask_cache_key: Optional[tuple[int, int]] = None
+        self._mask_cache_tensor: Optional[torch.Tensor] = None
+        self._mask_cache_version = -1
         self._mask_is_all_valid = False
+        self._derived_mask_cache_key: Optional[tuple[bool, int]] = None
+        self._derived_mask_cache: Optional[torch.Tensor] = None
+        self._sdpa_mask_cache_key: Optional[tuple[bool, int]] = None
+        self._sdpa_mask_cache: Optional[torch.Tensor] = None
+        self._half_attention_weights = None
+        self._cuda_backend: Optional[str] = None
+        self._empty_cuda_masks: dict[torch.device, torch.Tensor] = {}
         self._pack_qkv_weights()
 
     @torch.no_grad()
@@ -726,7 +740,13 @@ class UserOptimizedTransformer(nn.Module):
         result = super().load_state_dict(remapped, strict=strict, assign=assign)
         self._pack_qkv_weights()
         self._causal_mask_cache.clear()
-        self._mask_cache_key = None
+        self._mask_cache_tensor = None
+        self._derived_mask_cache_key = None
+        self._derived_mask_cache = None
+        self._sdpa_mask_cache_key = None
+        self._sdpa_mask_cache = None
+        self._half_attention_weights = None
+        self._cuda_backend = None
         return result
 
     def _valid_mask_or_none(
@@ -738,10 +758,19 @@ class UserOptimizedTransformer(nn.Module):
             version = valid_token_mask._version
         except RuntimeError:
             version = -1
-        key = (valid_token_mask.data_ptr(), version)
-        if key != self._mask_cache_key:
-            self._mask_cache_key = key
+        if (
+            valid_token_mask is not self._mask_cache_tensor
+            or version != self._mask_cache_version
+        ):
+            # Retaining the tensor itself prevents allocator pointer reuse from
+            # accidentally matching a different mask with the same _version.
+            self._mask_cache_tensor = valid_token_mask
+            self._mask_cache_version = version
             self._mask_is_all_valid = bool(valid_token_mask.all().item())
+            self._derived_mask_cache_key = None
+            self._derived_mask_cache = None
+            self._sdpa_mask_cache_key = None
+            self._sdpa_mask_cache = None
         return None if self._mask_is_all_valid else valid_token_mask
 
     def _causal_mask(self, device: torch.device, seq_len: int) -> torch.Tensor:
@@ -753,6 +782,58 @@ class UserOptimizedTransformer(nn.Module):
             mask = mask.view(1, 1, seq_len, seq_len).expand(1, self._num_heads, seq_len, seq_len)
             self._causal_mask_cache[key] = mask
         return mask
+
+    def _derived_attention_mask(
+        self, valid_token_mask: torch.Tensor, causal: bool, seq_len: int
+    ) -> torch.Tensor:
+        key = (causal, seq_len)
+        if key != self._derived_mask_cache_key:
+            invalid_keys = ~valid_token_mask
+            if causal:
+                self._derived_mask_cache = self._causal_mask(
+                    valid_token_mask.device, seq_len
+                ) | invalid_keys.view(-1, 1, 1, seq_len)
+            else:
+                self._derived_mask_cache = invalid_keys
+            self._derived_mask_cache_key = key
+        assert self._derived_mask_cache is not None
+        return self._derived_mask_cache
+
+    def _sdpa_attention_mask(
+        self, valid_token_mask: torch.Tensor, causal: bool, seq_len: int
+    ) -> torch.Tensor:
+        key = (causal, seq_len)
+        if key != self._sdpa_mask_cache_key:
+            # SDPA boolean masks use the opposite convention from the fused
+            # encoder primitive: True means that a key is allowed to attend.
+            allowed = valid_token_mask.view(-1, 1, 1, seq_len)
+            if causal:
+                allowed = allowed & ~self._causal_mask(
+                    valid_token_mask.device, seq_len
+                )
+            self._sdpa_mask_cache = allowed
+            self._sdpa_mask_cache_key = key
+        assert self._sdpa_mask_cache is not None
+        return self._sdpa_mask_cache
+
+    def _get_half_attention_weights(self):
+        weights = self._half_attention_weights
+        device = self._qkv_weights.device
+        if weights is None or weights[0][0].device != device:
+            # These inference-only shadows let Blackwell tensor cores execute
+            # QKV, SDPA and output projection in FP16 while the numerically
+            # sensitive residual stream, FFN and every LayerNorm remain FP32.
+            weights = []
+            for i, layer in enumerate(self.layers):
+                weights.append(
+                    (
+                        self._qkv_weights[i].detach().half(),
+                        self._qkv_biases[i].detach().half(),
+                        layer.out_proj.weight.detach().half(),
+                    )
+                )
+            self._half_attention_weights = weights
+        return weights
 
     def _run_layer(
         self,
@@ -785,7 +866,7 @@ class UserOptimizedTransformer(nn.Module):
             mask_type,
         )
 
-    def forward(
+    def _forward_native(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
@@ -804,17 +885,273 @@ class UserOptimizedTransformer(nn.Module):
         else:
             _, seq_len, _ = x.shape
             if self.config.causal:
-                mask = self._causal_mask(x.device, seq_len)
                 if has_padding:
-                    # Broadcast causal [1,H,S,S] across batch and combine key padding [B,1,1,S].
-                    mask = mask | (~valid_token_mask).view(-1, 1, 1, seq_len)
+                    mask = self._derived_attention_mask(
+                        valid_token_mask, causal=True, seq_len=seq_len
+                    )
+                else:
+                    mask = self._causal_mask(x.device, seq_len)
                 mask_type = 2
             else:
-                mask = ~valid_token_mask
+                mask = self._derived_attention_mask(
+                    valid_token_mask, causal=False, seq_len=seq_len
+                )
                 mask_type = 1
 
         for i in range(len(self.layers)):
             x = self._run_layer(i, x, mask, mask_type)
+
+        use_cuda_final_norm = (
+            _transformer_cuda_ext is not None
+            and x.is_cuda
+            and x.dtype == torch.float32
+            and self._d_model == 512
+            and x.is_contiguous()
+            and self.final_norm.weight.is_contiguous()
+            and self.final_norm.bias.is_contiguous()
+        )
+        if use_cuda_final_norm:
+            if has_padding:
+                x = _transformer_cuda_ext.layer_norm_mask(
+                    x,
+                    self.final_norm.weight,
+                    self.final_norm.bias,
+                    valid_token_mask,
+                    self.final_norm.eps,
+                )
+            else:
+                x = _transformer_cuda_ext.layer_norm(
+                    x,
+                    self.final_norm.weight,
+                    self.final_norm.bias,
+                    self.final_norm.eps,
+                )
+        else:
+            x = F.layer_norm(
+                x,
+                (self._d_model,),
+                self.final_norm.weight,
+                self.final_norm.bias,
+                self.final_norm.eps,
+            )
+            if has_padding:
+                x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
+
+    def _forward_custom_cuda(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        half_attention: bool,
+    ) -> torch.Tensor:
+        valid_token_mask = self._valid_mask_or_none(valid_token_mask)
+        batch, seq_len, _ = x.shape
+        if valid_token_mask is None:
+            attention_mask = None
+            is_causal = self.config.causal
+            extension_mask = self._empty_cuda_masks.get(x.device)
+            if extension_mask is None:
+                extension_mask = torch.empty(0, device=x.device, dtype=torch.bool)
+                self._empty_cuda_masks[x.device] = extension_mask
+        else:
+            attention_mask = self._sdpa_attention_mask(
+                valid_token_mask, self.config.causal, seq_len
+            )
+            is_causal = False
+            extension_mask = valid_token_mask
+
+        norm = F.layer_norm(
+            x,
+            (self._d_model,),
+            self.layers[0].norm1.weight,
+            self.layers[0].norm1.bias,
+            self.layers[0].norm1.eps,
+        )
+        residual = x
+        half_weights = self._get_half_attention_weights() if half_attention else None
+        head_dim = self._d_model // self._num_heads
+
+        for i, layer in enumerate(self.layers):
+            if half_attention:
+                qkv_weight, qkv_bias, out_weight = half_weights[i]
+                qkv = F.linear(norm.half(), qkv_weight, qkv_bias)
+            else:
+                qkv = F.linear(norm, self._qkv_weights[i], self._qkv_biases[i])
+
+            q, k, v = (
+                qkv.view(batch, seq_len, 3, self._num_heads, head_dim)
+                .permute(2, 0, 3, 1, 4)
+                .unbind(0)
+            )
+            context = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=is_causal,
+            )
+            context = (
+                context.transpose(1, 2)
+                .contiguous()
+                .view(batch, seq_len, self._d_model)
+            )
+            if half_attention:
+                attention_delta = F.linear(context, out_weight, None).float()
+            else:
+                attention_delta = F.linear(context, layer.out_proj.weight, None)
+
+            residual, norm2 = _transformer_cuda_ext.residual_bias_layer_norm(
+                residual,
+                attention_delta,
+                layer.out_proj.bias,
+                layer.norm2.weight,
+                layer.norm2.bias,
+                extension_mask,
+                layer.norm2.eps,
+                False,
+            )
+            hidden = _transformer_cuda_ext.bias_gelu(
+                F.linear(norm2, layer.ffn_in.weight, None),
+                layer.ffn_in.bias,
+            )
+            ffn_delta = F.linear(hidden, layer.ffn_out.weight, None)
+            next_norm = (
+                self.layers[i + 1].norm1
+                if i + 1 < len(self.layers)
+                else self.final_norm
+            )
+            residual, norm = _transformer_cuda_ext.residual_bias_layer_norm(
+                residual,
+                ffn_delta,
+                layer.ffn_out.bias,
+                next_norm.weight,
+                next_norm.bias,
+                extension_mask,
+                next_norm.eps,
+                i + 1 == len(self.layers),
+            )
+        return norm
+
+    @staticmethod
+    def _candidate_is_accurate(reference: torch.Tensor, candidate: torch.Tensor) -> bool:
+        error = (candidate - reference).abs()
+        passed = (error <= 0.001) | (error <= 0.01 * reference.abs())
+        return bool((torch.isfinite(candidate) & passed).all().item())
+
+    def _select_cuda_backend(
+        self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
+    ) -> str:
+        candidates = {"native": lambda: self._forward_native(x, valid_token_mask)}
+        custom_eligible = (
+            _transformer_cuda_ext is not None
+            and x.dtype == torch.float32
+            and self._d_model == 512
+            and self.config.ffn_dim == 2048
+            and x.is_contiguous()
+        )
+        if custom_eligible:
+            candidates["custom-fp32"] = lambda: self._forward_custom_cuda(
+                x, valid_token_mask, half_attention=False
+            )
+            candidates["custom-fp16-attention"] = lambda: self._forward_custom_cuda(
+                x, valid_token_mask, half_attention=True
+            )
+
+        reference = candidates["native"]()
+        accurate = {"native": candidates["native"]}
+        for name, candidate_fn in candidates.items():
+            if name == "native":
+                continue
+            if self._candidate_is_accurate(reference, candidate_fn()):
+                accurate[name] = candidate_fn
+
+        timings = {}
+        for name, candidate_fn in accurate.items():
+            for _ in range(2):
+                candidate_fn()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(8):
+                candidate_fn()
+            end.record()
+            end.synchronize()
+            timings[name] = start.elapsed_time(end) / 8
+
+        selected = min(timings, key=timings.get)
+        summary = ", ".join(f"{name}={ms:.4f} ms" for name, ms in timings.items())
+        print(f"[cuda autotune] selected {selected} ({summary})")
+        return selected
+
+    def _forward_exact_cuda(
+        self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Numerically exact fallback for causal or genuinely padded inputs."""
+        batch, seq_len, _ = x.shape
+        head_dim = self._d_model // self._num_heads
+        for layer in self.layers:
+            norm1 = F.layer_norm(
+                x,
+                (self._d_model,),
+                layer.norm1.weight,
+                layer.norm1.bias,
+                layer.norm1.eps,
+            )
+
+            def project(weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+                return (
+                    F.linear(norm1, weight, bias)
+                    .view(batch, seq_len, self._num_heads, head_dim)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+            q = project(layer.q_proj.weight, layer.q_proj.bias)
+            k = project(layer.k_proj.weight, layer.k_proj.bias)
+            v = project(layer.v_proj.weight, layer.v_proj.bias)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (head_dim**-0.5)
+            if self.config.causal:
+                causal_mask = torch.ones(
+                    (seq_len, seq_len), device=x.device, dtype=torch.bool
+                ).triu(1)
+                scores = scores.masked_fill(causal_mask, float("-inf"))
+            if valid_token_mask is not None:
+                scores = scores.masked_fill(
+                    ~valid_token_mask[:, None, None, :], float("-inf")
+                )
+            probabilities = torch.softmax(scores.float(), dim=-1).to(x.dtype)
+            context = torch.matmul(probabilities, v)
+            context = (
+                context.transpose(1, 2)
+                .contiguous()
+                .view(batch, seq_len, self._d_model)
+            )
+            attention = F.linear(
+                context, layer.out_proj.weight, layer.out_proj.bias
+            )
+            if valid_token_mask is not None:
+                attention = attention.masked_fill(
+                    ~valid_token_mask[..., None], 0
+                )
+            x = x + attention
+            norm2 = F.layer_norm(
+                x,
+                (self._d_model,),
+                layer.norm2.weight,
+                layer.norm2.bias,
+                layer.norm2.eps,
+            )
+            x = x + F.linear(
+                F.gelu(
+                    F.linear(norm2, layer.ffn_in.weight, layer.ffn_in.bias),
+                    approximate="none",
+                ),
+                layer.ffn_out.weight,
+                layer.ffn_out.bias,
+            )
+            if valid_token_mask is not None:
+                x = x.masked_fill(~valid_token_mask[..., None], 0)
 
         x = F.layer_norm(
             x,
@@ -823,9 +1160,29 @@ class UserOptimizedTransformer(nn.Module):
             self.final_norm.bias,
             self.final_norm.eps,
         )
-        if has_padding:
+        if valid_token_mask is not None:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            raise RuntimeError("UserOptimizedTransformer is inference-only")
+        if not x.is_cuda or torch.compiler.is_compiling():
+            return self._forward_native(x, valid_token_mask)
+        normalized_mask = self._valid_mask_or_none(valid_token_mask)
+        if self.config.causal or normalized_mask is not None:
+            return self._forward_exact_cuda(x, valid_token_mask)
+        if self._cuda_backend is None:
+            self._cuda_backend = self._select_cuda_backend(x, valid_token_mask)
+        if self._cuda_backend == "custom-fp32":
+            return self._forward_custom_cuda(x, valid_token_mask, half_attention=False)
+        if self._cuda_backend == "custom-fp16-attention":
+            return self._forward_custom_cuda(x, valid_token_mask, half_attention=True)
+        return self._forward_native(x, valid_token_mask)
 
 
 # Entry Pt
